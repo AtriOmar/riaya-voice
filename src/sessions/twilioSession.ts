@@ -1011,6 +1011,18 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 				case "get_cities":
 					result = this.getCities();
 					break;
+				case "search_location": {
+					const args = parsedArgs as { city?: string; query?: string };
+					if (!args.city || !args.query) {
+						result = JSON.stringify({
+							error: true,
+							message: "search_location: invalid arguments (expected city and query)",
+						});
+						break;
+					}
+					result = await this.searchLocation(args.city, args.query);
+					break;
+				}
 				case "end_call":
 					if (!this.callSid) {
 						result = JSON.stringify({
@@ -1222,6 +1234,52 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 				}),
 			),
 		);
+	}
+
+	private async searchLocation(city: string, query: string): Promise<string> {
+		const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY;
+		if (!GEOAPIFY_API_KEY) {
+			this.logger.error("GEOAPIFY_API_KEY is not set");
+			return JSON.stringify({ error: true, message: "Geocoding API key not configured." });
+		}
+		try {
+			const { data } = await axios.get("https://api.geoapify.com/v1/geocode/search", {
+				params: {
+					text: `${query}, ${city}`,
+					filter: "countrycode:tn",
+					limit: 5,
+					apiKey: GEOAPIFY_API_KEY,
+				},
+			});
+			const features = data.features || [];
+			if (features.length === 0) {
+				return JSON.stringify({
+					found: false,
+					message: "No results found. Please ask the patient for more context (e.g., region, city).",
+				});
+			}
+
+			// biome-ignore lint/suspicious/noExplicitAny: geoapify structure
+			const results = features.map((f: any) => ({
+				name: f.properties.formatted,
+				city: f.properties.city,
+				state: f.properties.state,
+				street: f.properties.street,
+				latitude: f.properties.lat,
+				longitude: f.properties.lon,
+			}));
+
+			return JSON.stringify({
+				found: true,
+				results,
+				message: results.length > 1 
+					? "Multiple results found. Please ask the patient to clarify which one they mean by presenting the options." 
+					: "One result found. Proceed with this location."
+			});
+		} catch (error) {
+			this.logger.error({ error }, "Geocoding API error");
+			return JSON.stringify({ error: true, message: "Failed to search location." });
+		}
 	}
 
 	private async findAvailableSlots(params: {
