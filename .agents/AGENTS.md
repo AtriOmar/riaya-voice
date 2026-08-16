@@ -110,6 +110,25 @@ This document is a compact project guide for AI assistants working on this repo.
 - `socket` calls Next API endpoints for doctor slots, external appointment creation, call persistence, and person upsert/update.
 - Server-to-server routes use `requireInternal` + `x-internal-secret` header (`INTERNAL_API_SECRET` on both services).
 
+### 8) Dashboard & Admin page layout structure
+
+- When creating pages in `dashboard` or `admin` (e.g., under `web/src/app/(navbar)/dashboard/*` or `web/src/app/(navbar)/admin/*`), follow the existing structure.
+- Keep `page.tsx` routes clean, lightweight wrappers that render feature components from `web/src/components/*`.
+- Always wrap the page content in the appropriate layout wrapper (e.g., `<DashboardLayout title="...">` or `<AdminLayout title="...">`).
+- Reference example (`web/src/app/(navbar)/dashboard/(verified)/patients/page.tsx`):
+  ```tsx
+  import PatientsList from "@/components/dashboard/patients/patients-list";
+  import DashboardLayout from "@/components/layouts/dashboard-layout";
+
+  export default function PatientsPage() {
+  	return (
+  		<DashboardLayout title="Patients">
+  			<PatientsList />
+  		</DashboardLayout>
+  	);
+  }
+  ```
+
 ## Database Notes
 
 - Drizzle schema lives in `web/src/db/schema.ts`.
@@ -186,6 +205,7 @@ Use these as examples before changing related code.
 - `web/src/lib/api-utils.ts` (auth/role/internal helpers for API routes)
 - `web/src/lib/upload.ts` + `web/src/services/upload.ts` (R2 presigned upload + `cdnUrl` return)
 - `web/src/components/dashboard/profile/image-cropper.tsx` (crop → blob → `uploadBlobToR2` → save URL)
+- `web/src/app/(navbar)/dashboard/(verified)/patients/page.tsx` (dashboard/admin page layout wrapper pattern)
 
 ### Backend/realtime references
 
@@ -223,6 +243,7 @@ Use these as examples before changing related code.
 - Use **pnpm** for package and script commands (see [Package management](#package-management)).
 - For schema changes in dev, prefer `pnpm db:push` in `web/`.
 - For R2 uploads, use `uploadToR2` / `uploadBlobToR2` and persist the returned **`cdnUrl`** (see [File uploads (Cloudflare R2)](#file-uploads-cloudflare-r2)).
+- When creating pages in `dashboard` or `admin`: keep `page.tsx` thin and wrap content in layout primitives (e.g. `<DashboardLayout title="...">` or `<AdminLayout title="...">`) as seen in `web/src/app/(navbar)/dashboard/(verified)/patients/page.tsx`.
 - When adding or changing frontend data access:
   - update/create service in `web/src/services`
   - update types in `web/src/services/types.ts` if shared
