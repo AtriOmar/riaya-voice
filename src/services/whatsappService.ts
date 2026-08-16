@@ -1,8 +1,11 @@
-﻿import { EventEmitter } from "node:events";
+import { EventEmitter } from "node:events";
+import fs from "node:fs";
 import path from "node:path";
 import type { Boom } from "@hapi/boom";
 import makeWASocket, {
+	Browsers,
 	DisconnectReason,
+	fetchLatestBaileysVersion,
 	useMultiFileAuthState,
 	type WASocket,
 } from "@whiskeysockets/baileys";
@@ -15,7 +18,7 @@ export type WhatsappStatus =
 	| { type: "disconnected"; reason?: string }
 	| { type: "connecting" };
 
-const AUTH_FOLDER = path.resolve("./whatsapp-auth");
+const AUTH_FOLDER = path.resolve("./whatsapp-auth/admin");
 
 const MAX_RECONNECT_ATTEMPTS = 10;
 const RECONNECT_INTERVAL_MS = 3_000;
@@ -119,13 +122,20 @@ export class WhatsappService extends EventEmitter {
 		// Always tear down first: reconnect used to stack sockets, both calling saveCreds → bad files.
 		await this.destroySocket();
 
+		const { version } = await fetchLatestBaileysVersion().catch(() => ({
+			version: [2, 3000, 1015901307] as [number, number, number],
+		}));
+
 		const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
 
 		this.sock = makeWASocket({
+			version,
 			auth: state,
 			logger: silentLogger,
 			printQRInTerminal: false,
-			browser: ["Riaya", "Chrome", "1.0.0"],
+			browser: Browsers.macOS("Riaya"),
+			syncFullHistory: false,
+			shouldSyncHistoryMessage: () => false,
 		});
 
 		this.sock.ev.on("creds.update", saveCreds);
@@ -164,21 +174,41 @@ export class WhatsappService extends EventEmitter {
 			if (connection === "close") {
 				this.connected = false;
 				this.phone = undefined;
+				this.lastQr = null;
 				const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
 				const reason =
 					DisconnectReason[statusCode as DisconnectReason] ??
 					String(statusCode);
-				this.logger.warn({ reason }, "[WhatsApp] Connection closed");
+				this.logger.warn(
+					{ reason, statusCode },
+					"[WhatsApp] Connection closed",
+				);
+
+				const isAuthFailure =
+					statusCode === DisconnectReason.loggedOut ||
+					statusCode === 405 ||
+					statusCode === DisconnectReason.connectionReplaced;
+
+				if (isAuthFailure) {
+					this.logger.warn(
+						"[WhatsApp] Auth failed/logged out. Clearing whatsapp-auth directory.",
+					);
+					try {
+						fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+					} catch {}
+				}
 
 				const payload: WhatsappStatus = { type: "disconnected", reason };
 				this.emit("status", payload);
 
-				const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+				const shouldReconnect = !isAuthFailure;
 				if (shouldReconnect) {
 					this.scheduleReconnect(reason);
 				} else {
 					this.resetReconnectState();
-					this.logger.warn("[WhatsApp] Logged out - manual re-link required");
+					this.logger.warn(
+						"[WhatsApp] Cleaned auth state - manual connect/reload required",
+					);
 				}
 			}
 		});

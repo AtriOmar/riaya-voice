@@ -1,7 +1,9 @@
 import http from "node:http";
 import { config } from "dotenv";
-config()
 
+config();
+
+import cors from "cors";
 import express, {
 	type NextFunction,
 	type Request,
@@ -11,10 +13,12 @@ import { pino } from "pino";
 import { type WebSocket, WebSocketServer } from "ws";
 import { ensureCallRow } from "./api/callsApi.js";
 import { ensurePersonRow } from "./api/personsApi.js";
+import {
+	WhatsappService,
+	type WhatsappStatus,
+} from "./services/whatsappService.js";
 import { getSystemMessage } from "./sessions/systemMessages.js";
 import { TwilioSession } from "./sessions/twilioSession.js";
-import { WhatsappService, type WhatsappStatus } from "./services/whatsappService.js";
-
 
 const PORT = process.env.PORT || 8080;
 
@@ -61,6 +65,7 @@ whatsappService.on("status", (payload: WhatsappStatus) => {
 
 // ==================== HTTP Routes ====================
 
+app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -71,14 +76,6 @@ app.get("/", (_req: Request, res: Response) => {
 
 // WhatsApp connection status — polled by the admin page on load
 app.get("/whatsapp-status", (_req: Request, res: Response) => {
-	const origin = _req.get("origin");
-	const allowed =
-		process.env.CORS_ORIGIN ||
-		process.env.NEXT_API_BASE_URL?.replace("/api", "") ||
-		"";
-	if (origin && allowed && origin === allowed) {
-		res.setHeader("Access-Control-Allow-Origin", origin);
-	}
 	res.json(whatsappService.getStatus());
 });
 
@@ -239,6 +236,12 @@ whatsappWss.on("connection", (ws: WebSocket) => {
 			ws.send(JSON.stringify({ type: "qr", data: lastQr }));
 		} else {
 			ws.send(JSON.stringify({ type: "disconnected" }));
+			// Automatically attempt connection/QR generation if not connected and no QR is cached
+			whatsappService
+				.connect()
+				.catch((err) =>
+					logger.error({ err }, "🔥 WhatsApp reconnect on WS connect failed"),
+				);
 		}
 	}
 
@@ -251,6 +254,8 @@ whatsappWss.on("connection", (ws: WebSocket) => {
 			};
 			if (msg.type === "send_message" && msg.phone && msg.message) {
 				await whatsappService.sendMessage(msg.phone, msg.message);
+			} else if (msg.type === "request_qr" || msg.type === "reconnect") {
+				await whatsappService.connect();
 			}
 		} catch (err) {
 			logger.error({ err }, "🔥 WhatsApp admin WS message error");
