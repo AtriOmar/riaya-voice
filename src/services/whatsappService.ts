@@ -87,6 +87,32 @@ export class WhatsappService extends EventEmitter {
 		this.rescheduleIdleShutdown();
 	}
 
+	async sendDocument(
+		phone: string,
+		documentUrl: string,
+		fileName?: string,
+		caption?: string,
+		mimetype?: string,
+	): Promise<void> {
+		if (!this.sock || !this.connected) {
+			this.logger.info({ userId: this.userId }, "[WhatsApp] Not connected, attempting reconnect before send…");
+			await this.connect();
+			await this.waitForConnection(15_000);
+		}
+		if (!this.sock || !this.connected) {
+			throw new Error("WhatsApp is not connected");
+		}
+		const jid = `${phone.replace(/\D/g, "")}@s.whatsapp.net`;
+		await this.sock.sendMessage(jid, {
+			document: { url: documentUrl },
+			fileName: fileName,
+			caption: caption,
+			mimetype: mimetype || "application/pdf", 
+		});
+		this.logger.info({ userId: this.userId, jid, fileName }, "[WhatsApp] Document sent");
+		this.rescheduleIdleShutdown();
+	}
+
 	/** Call when a UI websocket client connects so we keep the socket alive. */
 	addUiClient(): void {
 		this.uiClientCount += 1;

@@ -67,27 +67,39 @@ app.get("/whatsapp-status", (req: Request, res: Response) => {
 });
 
 // Send a WhatsApp message — called by web-ts appointment/prescription flow
-// Body: { userId: string; phone: string; message: string }
+// Body: { userId: string; phone: string; message?: string; documentUrl?: string; fileName?: string }
 app.post("/send-whatsapp", async (req: Request, res: Response) => {
-	const { userId, phone, message } = req.body as {
+	const { userId, phone, message, documentUrl, fileName, mimetype } = req.body as {
 		userId?: string;
 		phone?: string;
 		message?: string;
+		documentUrl?: string;
+		fileName?: string;
+		mimetype?: string;
 	};
-	if (!phone || !message) {
-		res.status(400).json({ error: "phone and message are required" });
+	if (!phone) {
+		res.status(400).json({ error: "phone is required" });
+		return;
+	}
+	if (!message && !documentUrl) {
+		res.status(400).json({ error: "message or documentUrl is required" });
 		return;
 	}
 	const resolvedUserId = userId?.trim() || "admin";
 	try {
-		await whatsappManager.getService(resolvedUserId).sendMessage(phone, message);
+		const service = whatsappManager.getService(resolvedUserId);
+		if (documentUrl) {
+			await service.sendDocument(phone, documentUrl, fileName, message, mimetype);
+		} else {
+			await service.sendMessage(phone, message!);
+		}
 		res.json({ ok: true });
 	} catch (err) {
 		logger.error(
 			{ err, userId: resolvedUserId },
-			"🔥 [WhatsApp] Failed to send message via HTTP route",
+			"🔥 [WhatsApp] Failed to send message/document via HTTP route",
 		);
-		res.status(500).json({ error: "Failed to send message" });
+		res.status(500).json({ error: "Failed to send message/document" });
 	}
 });
 
