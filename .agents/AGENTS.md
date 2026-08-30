@@ -129,6 +129,12 @@ This document is a compact project guide for AI assistants working on this repo.
   }
   ```
 
+### 9) External APIs and manual services
+
+- **Proxying vs Direct:** For 3rd-party APIs, if you need to hide secret keys or want the strict type-safety of OpenAPI generation, **proxy them** through Next.js API routes (`src/app/api/...`) and let Orval generate the hooks.
+- **Manual network services:** However, if proxying feels like overcomplication (e.g., no secrets are involved, or you just want a simple/quick direct fetcher), you can skip the proxy route entirely. Write a direct Axios call and place it in `web/src/services/manual/`. Do not put it in the root of `src/services/` to keep it clean for Orval.
+- **Client-side SDKs:** For browser-specific SDK wrappers (e.g., maps, analytics, direct-to-S3 uploads), place them in `web/src/lib/`.
+
 ## Database Notes
 
 - Drizzle schema lives in `web/src/db/schema.ts`.
@@ -244,8 +250,9 @@ Use these as examples before changing related code.
 - For R2 uploads, use `uploadToR2` / `uploadBlobToR2` and persist the returned **`cdnUrl`** (see [File uploads (Cloudflare R2)](#file-uploads-cloudflare-r2)).
 - When creating pages in `dashboard` or `admin`: keep `page.tsx` thin and wrap content in layout primitives (e.g. `<DashboardLayout title="...">` or `<AdminLayout title="...">`) as seen in `web/src/app/(navbar)/dashboard/(verified)/patients/page.tsx`.
 - When adding or changing frontend data access:
-  - update/create service in `web/src/services`
-  - update types in `web/src/services/types.ts` if shared
+  - DO NOT write manual fetchers in the root of `web/src/services/`. All internal data fetching MUST use Orval-generated hooks.
+  - For external APIs, proxy via Next.js if you need to hide secrets or want Orval to generate the hook.
+  - If proxying is overkill, or you just want a simple direct fetcher, place it in `web/src/services/manual/`.
   - consume via SWR/hooks/components
 - When adding API behavior:
   - implement in `web/src/app/api/.../route.ts`
