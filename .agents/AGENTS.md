@@ -41,8 +41,8 @@ This document is a compact project guide for AI assistants working on this repo.
 
 - `web/src/app`: Next app routes and API routes (`/api/...`)
 - `web/src/components`: UI and feature components
-- `web/src/services`: frontend API service layer (`patients.ts`, `persons.ts`, `appointments.ts`, etc.)
-- `web/src/services/types.ts`: app-level TS types used by services/components
+- `web/src/services`: API service configuration. Orval generates fetchers and SWR hooks in `web/src/services/generated/*`.
+- `web/src/services/types.ts`: app-level TS types (custom domain types).
 - `web/src/db`: Drizzle schema, DB instance, seeds
 - `web/src/lib`: shared utilities (`api-utils`, `person.ts`, auth helpers, SWR fetcher, etc.)
 - `web/src/hooks`: custom React hooks (including realtime dashboard socket)
@@ -61,12 +61,12 @@ This document is a compact project guide for AI assistants working on this repo.
 
 ## Working Conventions (Important)
 
-### 1) Services-first API consumption
+### 1) Generated API Client (`zod-to-openapi` + Orval)
 
-- For frontend API calls, create/update functions in `web/src/services/*.ts`.
-- Re-export via `web/src/services/index.ts` when appropriate.
-- Use shared axios instance from `web/src/services/api.ts`.
-- Keep route-specific request/response types close to services; shared/domain types live in `web/src/services/types.ts`.
+- **API routes MUST register their schemas**: Every route in `web/src/app/api/**/route.ts` must call `registry.registerPath()` at the bottom to define its OpenAPI spec.
+- **Never use `any`**: The OpenAPI schemas must be strictly typed! Use `drizzle-zod` schemas exported from `web/src/db/zod.ts` for all route responses and bodies. Never fallback to `z.any()`.
+- **Use tags**: Always include a `tags` array (e.g., `tags: ["Patients"]`) in the registration. This splits the generated outputs cleanly by domain.
+- **Regenerate after changes**: Whenever you add or update an API route, run `pnpm generate:api` in `web/` to regenerate the `openapi.json` and Orval fetchers, followed by `pnpm format` to format the generated code.
 
 ### 2) Types are explicit and centralized
 
@@ -80,11 +80,11 @@ This document is a compact project guide for AI assistants working on this repo.
 - Forms use `react-hook-form` + `zodResolver`.
 - Keep schema near the route/component that owns the validation.
 
-### 4) SWR usage pattern
+### 4) SWR and API consumption
 
-- Use `useSWR(key, serviceFn)` in client components.
-- Keep fetch logic in services, not inline in components.
-- Shared fetcher helper exists in `web/src/lib/swr.ts`.
+- Do NOT write manual Axios calls. Always use the Orval-generated SWR hooks and functions located in `web/src/services/generated/*`.
+- **For fetching (GET)**: Use the generated SWR hooks (e.g., `useGetApiPatients()`) in client components.
+- **For mutating (POST/PUT/DELETE/PATCH)**: Use the generated SWR mutation hooks (e.g., `usePostApiPatients()`). Call the returned `trigger(data)` function in your `onSubmit` handler, and run SWR's `mutate()` to revalidate cached queries upon success.
 
 ### 5) Tailwind + shadcn UI style
 
@@ -197,8 +197,7 @@ Use these as examples before changing related code.
 - `web/src/components/admin/applications-table.tsx` (table/data UI conventions)
 - `web/src/components/admin/calls/live-calls.tsx` (realtime dashboard UI pattern)
 - `web/src/hooks/use-realtime-socket.ts` (custom hook with websocket/reconnect logic)
-- `web/src/services/appointments.ts` (service file style and typed axios calls)
-- `web/src/services/patients.ts`, `web/src/services/persons.ts` (CRUD service patterns)
+- `web/src/services/generated/*` (Orval generated SWR hooks and API clients)
 - `web/src/services/types.ts` (shared domain/composite typing)
 - `web/src/app/api/appointments/route.ts` (API route + Zod + auth helper + Drizzle)
 - `web/src/lib/person.ts` (shared person upsert for routes)
