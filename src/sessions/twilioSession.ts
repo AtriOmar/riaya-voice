@@ -4,10 +4,10 @@ import type { Logger } from "pino";
 import twilio from "twilio";
 import { type RawData, WebSocket } from "ws";
 import { createCallEvent, ensureCallRow, updateCall } from "../api/callsApi.js";
+import { nextjsApi } from "../api/nextjsApiClient.js";
 import { ensurePersonRow, updatePersonRow } from "../api/personsApi.js";
 import { CITIES } from "../constants/cities.js";
 import { SPECIALITIES } from "../constants/specialities.js";
-import { nextjsApi } from "../api/nextjsApiClient.js";
 import type {
 	BestFitDoctor,
 	BookAppointmentParams,
@@ -16,7 +16,6 @@ import type {
 	SystemMessage,
 	TwilioMediaMessage,
 } from "../types/index.js";
-
 
 const {
 	BACKEND,
@@ -1016,7 +1015,8 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 					if (!args.city || !args.query) {
 						result = JSON.stringify({
 							error: true,
-							message: "search_location: invalid arguments (expected city and query)",
+							message:
+								"search_location: invalid arguments (expected city and query)",
 						});
 						break;
 					}
@@ -1240,22 +1240,29 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 		const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY;
 		if (!GEOAPIFY_API_KEY) {
 			this.logger.error("GEOAPIFY_API_KEY is not set");
-			return JSON.stringify({ error: true, message: "Geocoding API key not configured." });
+			return JSON.stringify({
+				error: true,
+				message: "Geocoding API key not configured.",
+			});
 		}
 		try {
-			const { data } = await axios.get("https://api.geoapify.com/v1/geocode/search", {
-				params: {
-					text: `${query}, ${city}`,
-					filter: "countrycode:tn",
-					limit: 5,
-					apiKey: GEOAPIFY_API_KEY,
+			const { data } = await axios.get(
+				"https://api.geoapify.com/v1/geocode/search",
+				{
+					params: {
+						text: `${query}, ${city}`,
+						filter: "countrycode:tn",
+						limit: 5,
+						apiKey: GEOAPIFY_API_KEY,
+					},
 				},
-			});
+			);
 			const features = data.features || [];
 			if (features.length === 0) {
 				return JSON.stringify({
 					found: false,
-					message: "No results found. Please ask the patient for more context (e.g., region, city).",
+					message:
+						"No results found. Please ask the patient for more context (e.g., region, city).",
 				});
 			}
 
@@ -1272,13 +1279,17 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 			return JSON.stringify({
 				found: true,
 				results,
-				message: results.length > 1 
-					? "Multiple results found. Please ask the patient to clarify which one they mean by presenting the options." 
-					: "One result found. Proceed with this location."
+				message:
+					results.length > 1
+						? "Multiple results found. Please ask the patient to clarify which one they mean by presenting the options."
+						: "One result found. Proceed with this location.",
 			});
 		} catch (error) {
 			this.logger.error({ error }, "Geocoding API error");
-			return JSON.stringify({ error: true, message: "Failed to search location." });
+			return JSON.stringify({
+				error: true,
+				message: "Failed to search location.",
+			});
 		}
 	}
 
@@ -1427,7 +1438,9 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 		});
 	}
 
-	private async bookAppointment(params: BookAppointmentToolArgs): Promise<string> {
+	private async bookAppointment(
+		params: BookAppointmentToolArgs,
+	): Promise<string> {
 		console.log(
 			"---------------------- book_appointment INPUT ----------------------",
 		);

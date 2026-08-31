@@ -1,0 +1,26 @@
+services:
+  voice:
+    image: ${DOCKER_IMAGE_VOICE:-riaya-voice}
+    container_name: riaya_voice
+    restart: unless-stopped
+    ports:
+      - "50003:8080" # Assuming voice uses 8080, adjust if needed
+    networks:
+      - riaya_network
+    environment:
+      - NODE_ENV=production
+    env_file:
+      - .env
+    # --- Security Hardening ---
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+
+networks:
+  riaya_network:
+    name: riaya_network
+    external: true

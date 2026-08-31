@@ -57,7 +57,10 @@ export class WhatsappService extends EventEmitter {
 
 	async connect(): Promise<void> {
 		this.resetReconnectState();
-		this.logger.info({ userId: this.userId }, "[WhatsApp] Starting Baileys connection…");
+		this.logger.info(
+			{ userId: this.userId },
+			"[WhatsApp] Starting Baileys connection…",
+		);
 		await this.startSocket();
 	}
 
@@ -72,7 +75,10 @@ export class WhatsappService extends EventEmitter {
 	async sendMessage(phone: string, text: string): Promise<void> {
 		if (!this.sock || !this.connected) {
 			// Not connected — try to bring it up (auth files exist) then retry once
-			this.logger.info({ userId: this.userId }, "[WhatsApp] Not connected, attempting reconnect before send…");
+			this.logger.info(
+				{ userId: this.userId },
+				"[WhatsApp] Not connected, attempting reconnect before send…",
+			);
 			await this.connect();
 			// Wait up to 15 s for connection to open
 			await this.waitForConnection(15_000);
@@ -95,7 +101,10 @@ export class WhatsappService extends EventEmitter {
 		mimetype?: string,
 	): Promise<void> {
 		if (!this.sock || !this.connected) {
-			this.logger.info({ userId: this.userId }, "[WhatsApp] Not connected, attempting reconnect before send…");
+			this.logger.info(
+				{ userId: this.userId },
+				"[WhatsApp] Not connected, attempting reconnect before send…",
+			);
 			await this.connect();
 			await this.waitForConnection(15_000);
 		}
@@ -107,23 +116,32 @@ export class WhatsappService extends EventEmitter {
 			document: { url: documentUrl },
 			fileName: fileName,
 			caption: caption,
-			mimetype: mimetype || "application/pdf", 
+			mimetype: mimetype || "application/pdf",
 		});
-		this.logger.info({ userId: this.userId, jid, fileName }, "[WhatsApp] Document sent");
+		this.logger.info(
+			{ userId: this.userId, jid, fileName },
+			"[WhatsApp] Document sent",
+		);
 		this.rescheduleIdleShutdown();
 	}
 
 	/** Call when a UI websocket client connects so we keep the socket alive. */
 	addUiClient(): void {
 		this.uiClientCount += 1;
-		this.logger.debug({ userId: this.userId, uiClientCount: this.uiClientCount }, "[WhatsApp] UI client added");
+		this.logger.debug(
+			{ userId: this.userId, uiClientCount: this.uiClientCount },
+			"[WhatsApp] UI client added",
+		);
 		this.clearIdleTimer();
 	}
 
 	/** Call when a UI websocket client disconnects. */
 	removeUiClient(): void {
 		this.uiClientCount = Math.max(0, this.uiClientCount - 1);
-		this.logger.debug({ userId: this.userId, uiClientCount: this.uiClientCount }, "[WhatsApp] UI client removed");
+		this.logger.debug(
+			{ userId: this.userId, uiClientCount: this.uiClientCount },
+			"[WhatsApp] UI client removed",
+		);
 		if (this.uiClientCount === 0) {
 			this.rescheduleIdleShutdown();
 		}
@@ -215,7 +233,10 @@ export class WhatsappService extends EventEmitter {
 			sock.ev.removeAllListeners("messages.upsert");
 			await sock.end(undefined);
 		} catch (err) {
-			this.logger.warn({ userId: this.userId, err }, "[WhatsApp] Error while closing socket");
+			this.logger.warn(
+				{ userId: this.userId, err },
+				"[WhatsApp] Error while closing socket",
+			);
 		}
 	}
 
@@ -245,7 +266,10 @@ export class WhatsappService extends EventEmitter {
 			const { connection, lastDisconnect, qr } = update;
 
 			if (qr) {
-				this.logger.info({ userId: this.userId }, "[WhatsApp] New QR code received");
+				this.logger.info(
+					{ userId: this.userId },
+					"[WhatsApp] New QR code received",
+				);
 				try {
 					const dataUrl = await toDataURL(qr);
 					this.lastQr = dataUrl;
@@ -254,7 +278,10 @@ export class WhatsappService extends EventEmitter {
 					const payload: WhatsappStatus = { type: "qr", data: dataUrl };
 					this.emit("status", payload);
 				} catch (err) {
-					this.logger.error({ userId: this.userId, err }, "[WhatsApp] Failed to generate QR image");
+					this.logger.error(
+						{ userId: this.userId, err },
+						"[WhatsApp] Failed to generate QR image",
+					);
 				}
 			}
 
@@ -264,7 +291,10 @@ export class WhatsappService extends EventEmitter {
 				this.connected = true;
 				this.lastQr = null;
 				this.phone = this.sock?.user?.id?.split(":")[0];
-				this.logger.info({ userId: this.userId, phone: this.phone }, "[WhatsApp] Connected");
+				this.logger.info(
+					{ userId: this.userId, phone: this.phone },
+					"[WhatsApp] Connected",
+				);
 				const payload: WhatsappStatus = {
 					type: "connected",
 					phone: this.phone,
@@ -329,7 +359,10 @@ export class WhatsappService extends EventEmitter {
 					msg.message?.conversation ??
 					msg.message?.extendedTextMessage?.text ??
 					"[media / unsupported]";
-				this.logger.info({ userId: this.userId, from, text }, "[WhatsApp] Incoming message");
+				this.logger.info(
+					{ userId: this.userId, from, text },
+					"[WhatsApp] Incoming message",
+				);
 			}
 		});
 	}

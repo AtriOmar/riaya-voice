@@ -17,6 +17,7 @@ import { whatsappManager } from "./services/whatsappManager.js";
 import type { WhatsappStatus } from "./services/whatsappService.js";
 import { getSystemMessage } from "./sessions/systemMessages.js";
 import { TwilioSession } from "./sessions/twilioSession.js";
+import "./workers/reviewWorker.js"; // Start the review worker
 
 const PORT = process.env.PORT || 8080;
 
@@ -69,14 +70,15 @@ app.get("/whatsapp-status", (req: Request, res: Response) => {
 // Send a WhatsApp message — called by web-ts appointment/prescription flow
 // Body: { userId: string; phone: string; message?: string; documentUrl?: string; fileName?: string }
 app.post("/send-whatsapp", async (req: Request, res: Response) => {
-	const { userId, phone, message, documentUrl, fileName, mimetype } = req.body as {
-		userId?: string;
-		phone?: string;
-		message?: string;
-		documentUrl?: string;
-		fileName?: string;
-		mimetype?: string;
-	};
+	const { userId, phone, message, documentUrl, fileName, mimetype } =
+		req.body as {
+			userId?: string;
+			phone?: string;
+			message?: string;
+			documentUrl?: string;
+			fileName?: string;
+			mimetype?: string;
+		};
 	if (!phone) {
 		res.status(400).json({ error: "phone is required" });
 		return;
@@ -89,7 +91,13 @@ app.post("/send-whatsapp", async (req: Request, res: Response) => {
 	try {
 		const service = whatsappManager.getService(resolvedUserId);
 		if (documentUrl) {
-			await service.sendDocument(phone, documentUrl, fileName, message, mimetype);
+			await service.sendDocument(
+				phone,
+				documentUrl,
+				fileName,
+				message,
+				mimetype,
+			);
 		} else {
 			await service.sendMessage(phone, message!);
 		}
@@ -266,7 +274,10 @@ whatsappWss.on("connection", (ws: WebSocket, request) => {
 			service
 				.connect()
 				.catch((err) =>
-					logger.error({ err, userId }, "🔥 WhatsApp reconnect on WS connect failed"),
+					logger.error(
+						{ err, userId },
+						"🔥 WhatsApp reconnect on WS connect failed",
+					),
 				);
 		}
 	}

@@ -96,12 +96,14 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
 					properties: {
 						city: {
 							type: "string",
-							description: "The city name provided by the patient (e.g., 'Tunis', 'Sfax')."
+							description:
+								"The city name provided by the patient (e.g., 'Tunis', 'Sfax').",
 						},
 						query: {
 							type: "string",
-							description: "The specific region, neighborhood, or street provided by the patient (e.g., 'Avenue Habib Bourguiba', 'Menzah 6')."
-						}
+							description:
+								"The specific region, neighborhood, or street provided by the patient (e.g., 'Avenue Habib Bourguiba', 'Menzah 6').",
+						},
 					},
 					required: ["city", "query"],
 				},
@@ -196,51 +198,45 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
 								"Appointment end: ISO 8601 in UTC ending with Z (from the chosen slot; convert if needed).",
 						},
 					},
-					required: [
-						"doctor_id",
-						"patient_name",
-						"illness",
-						"start",
-						"end",
-					],
+					required: ["doctor_id", "patient_name", "illness", "start", "end"],
 				},
 			},
-		{
-			type: "function",
-			name: "update_person_info",
-			description:
-				"Save the caller's personal details (name, date of birth, gender, address) collected during this call. Call this as soon as you have the caller's name — do not wait until the end of the call. You can call it again if more details become available. All parameters are optional.",
-			parameters: {
-				type: "object",
-				properties: {
-					first_name: {
-						type: "string",
-						description: "Caller's first name",
+			{
+				type: "function",
+				name: "update_person_info",
+				description:
+					"Save the caller's personal details (name, date of birth, gender, address) collected during this call. Call this as soon as you have the caller's name — do not wait until the end of the call. You can call it again if more details become available. All parameters are optional.",
+				parameters: {
+					type: "object",
+					properties: {
+						first_name: {
+							type: "string",
+							description: "Caller's first name",
+						},
+						last_name: {
+							type: "string",
+							description: "Caller's last name",
+						},
+						date_of_birth: {
+							type: "string",
+							description:
+								"Caller's date of birth as ISO 8601 UTC string (e.g. 1990-05-15T00:00:00.000Z)",
+						},
+						gender: {
+							type: "string",
+							description: "Caller's gender (e.g. male, female)",
+						},
+						address: {
+							type: "string",
+							description: "Caller's home address",
+						},
 					},
-					last_name: {
-						type: "string",
-						description: "Caller's last name",
-					},
-					date_of_birth: {
-						type: "string",
-						description:
-							"Caller's date of birth as ISO 8601 UTC string (e.g. 1990-05-15T00:00:00.000Z)",
-					},
-					gender: {
-						type: "string",
-						description: "Caller's gender (e.g. male, female)",
-					},
-					address: {
-						type: "string",
-						description: "Caller's home address",
-					},
+					required: [],
 				},
-				required: [],
 			},
-		},
-		{
-			type: "function",
-			name: "end_call",
+			{
+				type: "function",
+				name: "end_call",
 				description:
 					"Hang up and end this phone call. Use only after you have spoken your final lines to the patient, **including** a brief thanks for using Riaya in their language (along with confirmation, goodbye, SAMU 190 instruction, or other closure as needed). There is a short delay before disconnect so the patient can hear the end of your sentence.",
 				parameters: {
