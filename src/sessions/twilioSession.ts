@@ -378,6 +378,14 @@ export class TwilioSession {
 	/** Avoid stacking multiple Twilio REST hangups for one session. */
 	private hangupScheduled = false;
 
+	/**
+	 * True when the call originates from the browser test-call page rather than
+	 * a real Twilio call.  Set from `customParameters.simulated === "true"` or a
+	 * `CA_SIM*` callSid prefix.  Affects hangup: closes the WS instead of the
+	 * Twilio REST API.
+	 */
+	private isSimulated = false;
+
 	constructor(
 		private readonly twilioWs: WebSocket,
 		private readonly logger: Logger,
@@ -693,6 +701,12 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 					this.callerPhone = trimmed.length > 0 ? trimmed : null;
 					this.callStartedAt = new Date();
 
+					// Detect simulated browser calls so hangup closes the WS instead
+					// of calling the Twilio REST API (which would fail on fake SIDs).
+					this.isSimulated =
+						params.simulated === "true" ||
+						this.callSid.startsWith("CA_SIM");
+
 					// Ensure person exists (idempotent — /incoming-call likely already started this).
 					if (this.callerPhone) {
 						void ensurePersonRow(this.callerPhone).then((id) => {
@@ -885,6 +899,25 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 		this.hangupScheduled = true;
 		const delay = parseInt(process.env.END_CALL_DELAY_MS || "2500", 10);
 		const callSid = this.callSid;
+
+		// Simulated browser calls: close the media WebSocket instead of the
+		// Twilio REST API (which would 404 on fake CA_SIM* SIDs).
+		if (this.isSimulated) {
+			this.logger.info(
+				{ callSid, delayMs: delay },
+				"📴 Scheduling simulated call WS close",
+			);
+			setTimeout(() => {
+				this.logger.info({ callSid }, "📴 Closing simulated call WebSocket");
+				try {
+					this.twilioWs.close();
+				} catch {
+					// already closed
+				}
+			}, delay);
+			return;
+		}
+
 		const client = getTwilioRestClient();
 		this.logger.info(
 			{ callSid, delayMs: delay },
@@ -904,6 +937,12 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 				.catch((err: unknown) => {
 					this.hangupScheduled = false;
 					this.logger.error({ err, callSid }, "🔥 Failed to end Twilio call");
+					// Fallback: close the WS so the session still ends
+					try {
+						this.twilioWs.close();
+					} catch {
+						// already closed
+					}
 				});
 		}, delay);
 	}
@@ -1029,7 +1068,7 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 							error: true,
 							message: "end_call: no active call",
 						});
-					} else if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+					} else if (!this.isSimulated && (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN)) {
 						result = JSON.stringify({
 							error: true,
 							message: "end_call: Twilio credentials not configured",
