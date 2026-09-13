@@ -1,0 +1,14 @@
+Dockerfile
+.dockerignore
+node_modules
+npm-debug.log
+dist
+.git
+.github
+.agents
+whatsapp-auth
+*.log
+test_filtered_output.wav
+scripts
+.env
+.env.*

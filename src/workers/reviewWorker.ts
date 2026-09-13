@@ -15,7 +15,7 @@ const connection = new Redis(
 		maxRetriesPerRequest: null,
 	},
 );
-const APP_URL = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+const APP_URL = process.env.NEXTJS_API_URL || "http://localhost:3000";
 
 export const reviewWorker = new Worker(
 	"review-queue",
