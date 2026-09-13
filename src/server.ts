@@ -67,6 +67,20 @@ app.get("/whatsapp-status", (req: Request, res: Response) => {
 	res.json(whatsappManager.getService(userId).getStatus());
 });
 
+// Log out of WhatsApp and clear auth so a different account can be linked
+// Body: { userId?: string }  (defaults to "admin")
+app.post("/whatsapp-logout", async (req: Request, res: Response) => {
+	const userId =
+		(req.body as { userId?: string } | undefined)?.userId?.trim() || "admin";
+	try {
+		await whatsappManager.getService(userId).logout();
+		res.json({ ok: true });
+	} catch (err) {
+		logger.error({ err, userId }, "🔥 [WhatsApp] Logout failed");
+		res.status(500).json({ error: "Failed to log out of WhatsApp" });
+	}
+});
+
 // Send a WhatsApp message — called by web-ts appointment/prescription flow
 // Body: { userId: string; phone: string; message?: string; documentUrl?: string; fileName?: string }
 app.post("/send-whatsapp", async (req: Request, res: Response) => {
@@ -291,6 +305,8 @@ whatsappWss.on("connection", (ws: WebSocket, request) => {
 			};
 			if (msg.type === "send_message" && msg.phone && msg.message) {
 				await service.sendMessage(msg.phone, msg.message);
+			} else if (msg.type === "logout") {
+				await service.logout();
 			} else if (msg.type === "request_qr" || msg.type === "reconnect") {
 				await service.connect();
 			}

@@ -147,6 +147,54 @@ export class WhatsappService extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Log out of WhatsApp, clear saved auth, and start a fresh connection
+	 * so a new QR code can be scanned (e.g. to link a different account).
+	 */
+	async logout(): Promise<void> {
+		this.logger.info({ userId: this.userId }, "[WhatsApp] Logging out…");
+		this.resetReconnectState();
+		this.clearIdleTimer();
+
+		const sock = this.sock;
+		// Detach first so the close handler cannot race with the fresh connect below
+		// (e.g. wipe auth files that the new socket has started writing).
+		this.sock = null;
+		if (sock) {
+			try {
+				sock.ev.removeAllListeners("creds.update");
+				sock.ev.removeAllListeners("connection.update");
+				sock.ev.removeAllListeners("messages.upsert");
+				await sock.logout();
+			} catch (err) {
+				this.logger.warn(
+					{ userId: this.userId, err },
+					"[WhatsApp] Error during sock.logout — ending socket and clearing auth locally",
+				);
+				try {
+					await sock.end(undefined);
+				} catch {}
+			}
+		}
+
+		try {
+			fs.rmSync(this.authFolder, { recursive: true, force: true });
+		} catch (err) {
+			this.logger.warn(
+				{ userId: this.userId, err },
+				"[WhatsApp] Failed to clear auth directory during logout",
+			);
+		}
+
+		this.connected = false;
+		this.phone = undefined;
+		this.lastQr = null;
+		this.emit("status", { type: "disconnected", reason: "logged_out" });
+
+		// Bring up a new socket so the admin can scan a QR for another account
+		await this.connect();
+	}
+
 	// ─── Idle / Shutdown ─────────────────────────────────────────────────────
 
 	private clearIdleTimer(): void {
