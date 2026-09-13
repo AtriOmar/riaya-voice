@@ -1,5 +1,6 @@
 allowBuilds:
   '@whiskeysockets/baileys': true
   esbuild: true
+  msgpackr-extract: true
   protobufjs: true
   sharp: true

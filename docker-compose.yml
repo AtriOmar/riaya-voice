@@ -1,0 +1,33 @@
+services:
+  voice:
+    image: ${DOCKER_IMAGE}
+    container_name: riaya_voice
+    restart: unless-stopped
+    ports:
+      - "${PORT:-50003}:8080"
+    networks:
+      - riaya_network
+    environment:
+      - NODE_ENV=production
+      - PORT=8080
+    env_file:
+      - .env
+    volumes:
+      - voice_whatsapp_auth:/app/whatsapp-auth
+    # --- Security Hardening ---
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+
+networks:
+  riaya_network:
+    name: riaya_network
+    external: true
+
+volumes:
+  voice_whatsapp_auth:
+    name: voice_whatsapp_auth

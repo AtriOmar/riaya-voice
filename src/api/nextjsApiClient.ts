@@ -1,7 +1,7 @@
 import axios from "axios";
 import { config } from "dotenv";
 
-config()
+config();
 
 /** Axios client for the Next.js app REST API (`NEXTJS_API_URL`). */
 export const nextjsApi = axios.create({

@@ -4,10 +4,10 @@ import type { Logger } from "pino";
 import twilio from "twilio";
 import { type RawData, WebSocket } from "ws";
 import { createCallEvent, ensureCallRow, updateCall } from "../api/callsApi.js";
+import { nextjsApi } from "../api/nextjsApiClient.js";
 import { ensurePersonRow, updatePersonRow } from "../api/personsApi.js";
 import { CITIES } from "../constants/cities.js";
 import { SPECIALITIES } from "../constants/specialities.js";
-import { nextjsApi } from "../api/nextjsApiClient.js";
 import type {
 	BestFitDoctor,
 	BookAppointmentParams,
@@ -16,7 +16,6 @@ import type {
 	SystemMessage,
 	TwilioMediaMessage,
 } from "../types/index.js";
-
 
 const {
 	BACKEND,
@@ -379,6 +378,14 @@ export class TwilioSession {
 	/** Avoid stacking multiple Twilio REST hangups for one session. */
 	private hangupScheduled = false;
 
+	/**
+	 * True when the call originates from the browser test-call page rather than
+	 * a real Twilio call.  Set from `customParameters.simulated === "true"` or a
+	 * `CA_SIM*` callSid prefix.  Affects hangup: closes the WS instead of the
+	 * Twilio REST API.
+	 */
+	private isSimulated = false;
+
 	constructor(
 		private readonly twilioWs: WebSocket,
 		private readonly logger: Logger,
@@ -694,6 +701,12 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 					this.callerPhone = trimmed.length > 0 ? trimmed : null;
 					this.callStartedAt = new Date();
 
+					// Detect simulated browser calls so hangup closes the WS instead
+					// of calling the Twilio REST API (which would fail on fake SIDs).
+					this.isSimulated =
+						params.simulated === "true" ||
+						this.callSid.startsWith("CA_SIM");
+
 					// Ensure person exists (idempotent — /incoming-call likely already started this).
 					if (this.callerPhone) {
 						void ensurePersonRow(this.callerPhone).then((id) => {
@@ -886,6 +899,25 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 		this.hangupScheduled = true;
 		const delay = parseInt(process.env.END_CALL_DELAY_MS || "2500", 10);
 		const callSid = this.callSid;
+
+		// Simulated browser calls: close the media WebSocket instead of the
+		// Twilio REST API (which would 404 on fake CA_SIM* SIDs).
+		if (this.isSimulated) {
+			this.logger.info(
+				{ callSid, delayMs: delay },
+				"📴 Scheduling simulated call WS close",
+			);
+			setTimeout(() => {
+				this.logger.info({ callSid }, "📴 Closing simulated call WebSocket");
+				try {
+					this.twilioWs.close();
+				} catch {
+					// already closed
+				}
+			}, delay);
+			return;
+		}
+
 		const client = getTwilioRestClient();
 		this.logger.info(
 			{ callSid, delayMs: delay },
@@ -905,6 +937,12 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 				.catch((err: unknown) => {
 					this.hangupScheduled = false;
 					this.logger.error({ err, callSid }, "🔥 Failed to end Twilio call");
+					// Fallback: close the WS so the session still ends
+					try {
+						this.twilioWs.close();
+					} catch {
+						// already closed
+					}
 				});
 		}, delay);
 	}
@@ -1011,13 +1049,26 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 				case "get_cities":
 					result = this.getCities();
 					break;
+				case "search_location": {
+					const args = parsedArgs as { city?: string; query?: string };
+					if (!args.city || !args.query) {
+						result = JSON.stringify({
+							error: true,
+							message:
+								"search_location: invalid arguments (expected city and query)",
+						});
+						break;
+					}
+					result = await this.searchLocation(args.city, args.query);
+					break;
+				}
 				case "end_call":
 					if (!this.callSid) {
 						result = JSON.stringify({
 							error: true,
 							message: "end_call: no active call",
 						});
-					} else if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+					} else if (!this.isSimulated && (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN)) {
 						result = JSON.stringify({
 							error: true,
 							message: "end_call: Twilio credentials not configured",
@@ -1224,6 +1275,63 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 		);
 	}
 
+	private async searchLocation(city: string, query: string): Promise<string> {
+		const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY;
+		if (!GEOAPIFY_API_KEY) {
+			this.logger.error("GEOAPIFY_API_KEY is not set");
+			return JSON.stringify({
+				error: true,
+				message: "Geocoding API key not configured.",
+			});
+		}
+		try {
+			const { data } = await axios.get(
+				"https://api.geoapify.com/v1/geocode/search",
+				{
+					params: {
+						text: `${query}, ${city}`,
+						filter: "countrycode:tn",
+						limit: 5,
+						apiKey: GEOAPIFY_API_KEY,
+					},
+				},
+			);
+			const features = data.features || [];
+			if (features.length === 0) {
+				return JSON.stringify({
+					found: false,
+					message:
+						"No results found. Please ask the patient for more context (e.g., region, city).",
+				});
+			}
+
+			// biome-ignore lint/suspicious/noExplicitAny: geoapify structure
+			const results = features.map((f: any) => ({
+				name: f.properties.formatted,
+				city: f.properties.city,
+				state: f.properties.state,
+				street: f.properties.street,
+				latitude: f.properties.lat,
+				longitude: f.properties.lon,
+			}));
+
+			return JSON.stringify({
+				found: true,
+				results,
+				message:
+					results.length > 1
+						? "Multiple results found. Please ask the patient to clarify which one they mean by presenting the options."
+						: "One result found. Proceed with this location.",
+			});
+		} catch (error) {
+			this.logger.error({ error }, "Geocoding API error");
+			return JSON.stringify({
+				error: true,
+				message: "Failed to search location.",
+			});
+		}
+	}
+
 	private async findAvailableSlots(params: {
 		specialitySlug: string;
 		latitude: number;
@@ -1369,7 +1477,9 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 		});
 	}
 
-	private async bookAppointment(params: BookAppointmentToolArgs): Promise<string> {
+	private async bookAppointment(
+		params: BookAppointmentToolArgs,
+	): Promise<string> {
 		console.log(
 			"---------------------- book_appointment INPUT ----------------------",
 		);

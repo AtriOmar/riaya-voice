@@ -2,12 +2,12 @@
 node_modules/
 npm-shrinkwrap.json
 yarn.lock
-pnpm-lock.yaml
 package-lock.json
 
 # Environment variables
 .env
 .env.local
+.env.production
 .env.*.local
 .env.production.local
 .env.test.local
