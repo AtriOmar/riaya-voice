@@ -12,6 +12,7 @@ import express, {
 import { pino } from "pino";
 import { type WebSocket, WebSocketServer } from "ws";
 import { ensureCallRow } from "./api/callsApi.js";
+import { nextjsApi } from "./api/nextjsApiClient.js";
 import { ensurePersonRow } from "./api/personsApi.js";
 import { whatsappManager } from "./services/whatsappManager.js";
 import type { WhatsappStatus } from "./services/whatsappService.js";
@@ -82,18 +83,26 @@ app.post("/whatsapp-logout", async (req: Request, res: Response) => {
 	}
 });
 
-// Send a WhatsApp message — called by web-ts appointment/prescription flow
-// Body: { userId: string; phone: string; message?: string; documentUrl?: string; fileName?: string }
+// Send a WhatsApp message — called by web appointment/invoice/file flows
+// Body: { userId, phone, message?, documentUrl?, fileName?, mimetype?, quotaConsumed? }
 app.post("/send-whatsapp", async (req: Request, res: Response) => {
-	const { userId, phone, message, documentUrl, fileName, mimetype } =
-		req.body as {
-			userId?: string;
-			phone?: string;
-			message?: string;
-			documentUrl?: string;
-			fileName?: string;
-			mimetype?: string;
-		};
+	const {
+		userId,
+		phone,
+		message,
+		documentUrl,
+		fileName,
+		mimetype,
+		quotaConsumed,
+	} = req.body as {
+		userId?: string;
+		phone?: string;
+		message?: string;
+		documentUrl?: string;
+		fileName?: string;
+		mimetype?: string;
+		quotaConsumed?: boolean;
+	};
 	if (!phone) {
 		res.status(400).json({ error: "phone is required" });
 		return;
@@ -104,6 +113,31 @@ app.post("/send-whatsapp", async (req: Request, res: Response) => {
 	}
 	const resolvedUserId = userId?.trim() || "admin";
 	try {
+		// Enforce plan limit unless the web app already consumed quota
+		if (!quotaConsumed && resolvedUserId !== "admin") {
+			try {
+				await nextjsApi.post(
+					"/api/internal/billing/consume-whatsapp",
+					{ userId: resolvedUserId, count: 1 },
+					{
+						headers: {
+							"x-internal-secret": process.env.INTERNAL_API_SECRET ?? "",
+						},
+					},
+				);
+			} catch (quotaErr: unknown) {
+				const ax = quotaErr as {
+					response?: { status?: number; data?: { error?: string } };
+				};
+				const code = ax.response?.data?.error;
+				if (code === "WHATSAPP_LIMIT_REACHED") {
+					res.status(403).json({ error: "WHATSAPP_LIMIT_REACHED" });
+					return;
+				}
+				throw quotaErr;
+			}
+		}
+
 		const service = whatsappManager.getService(resolvedUserId);
 		if (documentUrl) {
 			await service.sendDocument(
