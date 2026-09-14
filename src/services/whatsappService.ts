@@ -115,7 +115,7 @@ export class WhatsappService extends EventEmitter {
 		await this.sock.sendMessage(jid, {
 			document: { url: documentUrl },
 			fileName: fileName,
-			caption: caption,
+			...(caption?.trim() ? { caption } : {}),
 			mimetype: mimetype || "application/pdf",
 		});
 		this.logger.info(

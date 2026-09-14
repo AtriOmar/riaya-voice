@@ -233,9 +233,20 @@ Use these as examples before changing related code.
 
 - `get_specialities`, `get_cities` — static lists in socket constants.
 - `find_available_slots`, `find_doctor_slots` — Next doctor/slot APIs.
-- `update_person_info` — `PATCH /api/persons/[id]` via `updatePersonRow`; call after collecting name/details.
-- `book_appointment` — `POST /api/appointments/external`. Tool args: `doctor_id`, `patient_name`, `illness`, `start`, `end` only. **Phone is not an AI parameter**; `bookAppointment()` sends `this.callerPhone` (digits only) server-side.
-- `end_call` — schedules Twilio hangup after closing message.
+- `update_person_info` — `PATCH /api/persons/[id]` via `updatePersonRow`; name, language preference, etc.
+- `list_my_ai_appointments` / `cancel_appointment` — `callerAppointmentsApi.ts` → internal Next routes; **phone from `this.callerPhone` only** (never tool args). Cancel **pending** AI bookings only; confirmed → patient contacts doctor.
+- `book_appointment` — `POST /api/appointments/external`. Tool args: `doctor_id`, `patient_name`, `illness`, `start`, `end` only. **Phone is not an AI parameter**; `bookAppointment()` sends `this.callerPhone` server-side.
+- `end_call` — schedules disconnect; assistant says a brief thank-you/goodbye, then hangup after playback.
+
+Person row from `ensurePersonRow` drives greeting first name + `preferredLanguage` in session instructions. Do not mention appointments in opening greeting.
+
+### Manual test (caller appointments)
+
+1. Person with `firstName` → personalized greeting; no appointment mention upfront.
+2. Pending AI booking on caller phone → ask location/time → `list_my_ai_appointments` returns doctor/address.
+3. Cancel pending → `cancel_appointment` succeeds.
+4. Confirmed booking → cancel tool returns not cancellable; prompt directs to doctor.
+5. Simulated call without caller phone → list/cancel tools error clearly.
 
 ### Conversation style (prompt)
 

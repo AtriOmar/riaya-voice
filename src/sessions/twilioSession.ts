@@ -5,6 +5,10 @@ import twilio from "twilio";
 import { type RawData, WebSocket } from "ws";
 import { createCallEvent, ensureCallRow, updateCall } from "../api/callsApi.js";
 import { nextjsApi } from "../api/nextjsApiClient.js";
+import {
+	cancelCallerAiAppointment,
+	listCallerAiAppointments,
+} from "../api/callerAppointmentsApi.js";
 import { ensurePersonRow, updatePersonRow } from "../api/personsApi.js";
 import { CITIES } from "../constants/cities.js";
 import { SPECIALITIES } from "../constants/specialities.js";
@@ -64,6 +68,34 @@ const SESSION_CONFIG = {
 		10,
 	),
 };
+
+type CallLanguage = "en" | "fr" | "ar";
+
+function buildInitialGreetingInstructions(
+	lang: CallLanguage,
+	firstName?: string | null,
+): string {
+	const name = firstName?.trim();
+	const withName = name && name.length > 0;
+	if (lang === "fr") {
+		return withName
+			? `Say exactly one short sentence in French greeting ${name} by first name, introduce yourself as Riaya, and ask how you can help. Do NOT mention appointments. Do NOT call any functions.`
+			: 'Say exactly one short sentence in French: "Bonjour, ici Riaya. Comment puis-je vous aider?" Do NOT call any functions.';
+	}
+	if (lang === "ar") {
+		return withName
+			? `Say exactly one short sentence in Tunisian Arabic (Derja): "أهلا ${name}، معاك رعاية. شنوّا نجم نعاونك?" Do NOT mention appointments. Do NOT call any functions.`
+			: 'Say exactly one short sentence in Tunisian Arabic (Derja): "أهلا، معاك رعاية. شنوّا نجم نعاونك?" Do NOT call any functions.';
+	}
+	return withName
+		? `Say exactly one short sentence greeting ${name} by first name, say "Hello, this is Riaya," and ask how you can help. Do NOT mention appointments. Do NOT call any functions.`
+		: 'Say exactly one short sentence: "Hello, this is Riaya. How can I help you?" Do NOT call any functions.';
+}
+
+function normalizeCallLanguage(raw: unknown): CallLanguage {
+	if (raw === "en" || raw === "fr" || raw === "ar") return raw;
+	return "ar";
+}
 
 // ==================== Tool / HTTP logging ====================
 
@@ -165,6 +197,7 @@ type UpdatePersonInfoToolArgs = {
 	dateOfBirth?: string;
 	gender?: string;
 	address?: string;
+	preferredLanguage?: CallLanguage;
 };
 
 function strField(
@@ -297,13 +330,25 @@ function normalizeUpdatePersonInfoArgs(
 	const dateOfBirth = strField(o, "date_of_birth", "dateOfBirth");
 	const gender = strField(o, "gender", "gender");
 	const address = strField(o, "address", "address");
+	const preferredLanguageRaw = strField(
+		o,
+		"preferred_language",
+		"preferredLanguage",
+	);
+	const preferredLanguage =
+		preferredLanguageRaw === "en" ||
+		preferredLanguageRaw === "fr" ||
+		preferredLanguageRaw === "ar"
+			? preferredLanguageRaw
+			: undefined;
 
 	if (
 		firstName === undefined &&
 		lastName === undefined &&
 		dateOfBirth === undefined &&
 		gender === undefined &&
-		address === undefined
+		address === undefined &&
+		preferredLanguage === undefined
 	) {
 		return null;
 	}
@@ -314,7 +359,31 @@ function normalizeUpdatePersonInfoArgs(
 		...(dateOfBirth !== undefined ? { dateOfBirth } : {}),
 		...(gender !== undefined ? { gender } : {}),
 		...(address !== undefined ? { address } : {}),
+		...(preferredLanguage !== undefined ? { preferredLanguage } : {}),
 	};
+}
+
+function normalizeCancelAppointmentArgs(
+	raw: unknown,
+): { appointmentId: number } | null {
+	if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+		return null;
+	const o = raw as Record<string, unknown>;
+	const idRaw = o.appointment_id ?? o.appointmentId;
+	let appointmentId: number | null = null;
+	if (typeof idRaw === "number") appointmentId = idRaw;
+	if (typeof idRaw === "string" && idRaw.trim() !== "") {
+		const parsed = Number(idRaw);
+		if (Number.isFinite(parsed)) appointmentId = parsed;
+	}
+	if (
+		appointmentId === null ||
+		!Number.isInteger(appointmentId) ||
+		appointmentId <= 0
+	) {
+		return null;
+	}
+	return { appointmentId };
 }
 
 // ==================== OpenAI Realtime Event Types ====================
@@ -370,6 +439,13 @@ export class TwilioSession {
 
 	/** Only the first session.update should trigger the opening greeting */
 	private initialGreetingSent = false;
+	/** Twilio media `start` received — callerPhone / person lookup may still be in flight. */
+	private twilioStreamStarted = false;
+	/** Loaded from person row (or default ar) before first greeting when possible. */
+	private personProfileResolved = false;
+	/** Saved preference + active call language (default Arabic). */
+	private callerPreferredLanguage: CallLanguage = "ar";
+	private callerFirstName: string | null = null;
 
 	/** Next.js DB row id for this call (available once ensureCallRow resolves). */
 	private dbCallIdPromise: Promise<number | null> | null = null;
@@ -377,6 +453,14 @@ export class TwilioSession {
 
 	/** Avoid stacking multiple Twilio REST hangups for one session. */
 	private hangupScheduled = false;
+	/** `end_call` was invoked; hang up after the assistant goodbye response finishes. */
+	private pendingHangup = false;
+	/** Ignore the next `response.done` (the turn that invoked `end_call`); hang up after the following one. */
+	private skipNextResponseDoneForEndCall = false;
+	/** Goodbye audio has finished generating; hang up once Twilio marks drain. */
+	private hangupAfterPlayback = false;
+	private hangupTimer: ReturnType<typeof setTimeout> | null = null;
+	private fallbackHangupTimer: ReturnType<typeof setTimeout> | null = null;
 
 	/**
 	 * True when the call originates from the browser test-call page rather than
@@ -471,12 +555,68 @@ export class TwilioSession {
 	}
 
 	private buildSessionInstructions(): string {
-		if (!this.callerPhone) return this.systemMessage.message;
-		return `${this.systemMessage.message}
+		const lang = this.callerPreferredLanguage;
+		const langLabel =
+			lang === "en"
+				? "English"
+				: lang === "fr"
+					? "French"
+					: "Tunisian Arabic (Derja)";
+		const knownName = this.callerFirstName?.trim();
+		const profileBlock = knownName
+			? `Known first name: **${knownName}** (use in greeting; you may skip asking for name unless unclear).`
+			: "Name not on file yet — ask for their name early in the booking flow.";
+		let instructions = `${this.systemMessage.message}
+
+## CALLER PROFILE
+${profileBlock}
+Do **not** mention existing appointments in the opening greeting. Use \`list_my_ai_appointments\` only when the patient asks about a booking, doctor, location, time, or cancellation.
+
+## CALLER LANGUAGE PREFERENCE
+Stored preference for this caller: **${lang}** (${langLabel}). **Start and respond in this language** until the patient asks to switch.
+If they ask to speak another supported language (English, French, or Tunisian Derja), switch immediately and call \`update_person_info\` with \`preferred_language\` set to \`en\`, \`fr\`, or \`ar\` (use \`ar\` for Tunisian Derja).`;
+
+		if (!this.callerPhone) return instructions;
+		return `${instructions}
 
 ## CALLER PHONE (THIS LINE)
 The phone number for this call is: **${this.callerPhone}**.
-The server uses this number automatically when \`book_appointment\` runs. Do **not** ask the patient about their phone number.`;
+The server uses this number automatically when \`book_appointment\`, \`list_my_ai_appointments\`, or \`cancel_appointment\` runs. Do **not** ask the patient about their phone number.`;
+	}
+
+	private applyPersonRow(row: {
+		id: number;
+		firstName?: string | null;
+		lastName?: string | null;
+		preferredLanguage?: string | null;
+	}) {
+		this.personId = row.id;
+		this.callerFirstName = row.firstName?.trim() || null;
+		this.callerPreferredLanguage = normalizeCallLanguage(row.preferredLanguage);
+		this.personProfileResolved = true;
+		this.logger.info(
+			{
+				personId: row.id,
+				preferredLanguage: this.callerPreferredLanguage,
+				hasFirstName: Boolean(this.callerFirstName),
+			},
+			"👤 Person profile applied",
+		);
+	}
+
+	private markPersonProfileResolvedWithoutRow() {
+		this.personProfileResolved = true;
+	}
+
+	private trySendInitialGreeting() {
+		if (this.initialGreetingSent) return;
+		if (this.openAIWs?.readyState !== WebSocket.OPEN) return;
+		// OpenAI often reaches SessionUpdated before Twilio `start`; wait so we can load name/lang.
+		if (!this.twilioStreamStarted) return;
+		if (!this.personProfileResolved) return;
+
+		this.initialGreetingSent = true;
+		this.sendInitialGreeting();
 	}
 
 	private sendSessionConfig() {
@@ -501,16 +641,23 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 	private sendInitialGreeting() {
 		if (this.openAIWs?.readyState !== WebSocket.OPEN) return;
 
+		const instructions = buildInitialGreetingInstructions(
+			this.callerPreferredLanguage,
+			this.callerFirstName,
+		);
 		this.openAIWs.send(
 			JSON.stringify({
 				type: "response.create",
 				response: {
 					modalities: ["text", "audio"],
-					instructions: this.systemMessage.initialInstructions,
+					instructions,
 				},
 			}),
 		);
-		this.logger.info("🗣️ Initial greeting triggered");
+		this.logger.info(
+			{ language: this.callerPreferredLanguage },
+			"🗣️ Initial greeting triggered",
+		);
 	}
 
 	// ==================== OpenAI Event Handlers ====================
@@ -543,10 +690,7 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 
 				[EVENTS.SessionUpdated]: () => {
 					this.logger.info("✅ Session config updated");
-					if (!this.initialGreetingSent) {
-						this.initialGreetingSent = true;
-						this.sendInitialGreeting();
-					}
+					this.trySendInitialGreeting();
 				},
 
 				[EVENTS.ResponseAudioDelta]: (e) => this.handleAudioDelta(e),
@@ -609,7 +753,10 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 				[EVENTS.ResponseFunctionCallArgumentsDone]: (e) =>
 					this.handleFunctionCall(e),
 
-				[EVENTS.ResponseDone]: () => this.logger.debug("✅ Response complete"),
+				[EVENTS.ResponseDone]: () => {
+					this.logger.debug("✅ Response complete");
+					this.onResponseDone();
+				},
 
 				[EVENTS.Error]: (e) => {
 					this.logger.error({ error: e.error }, "🔥 OpenAI error");
@@ -688,6 +835,7 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 					break;
 
 				case "start": {
+					this.twilioStreamStarted = true;
 					this.streamSid = msg.streamSid;
 					this.callSid = msg.start.callSid;
 					const params = msg.start.customParameters ?? {};
@@ -704,17 +852,22 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 					// Detect simulated browser calls so hangup closes the WS instead
 					// of calling the Twilio REST API (which would fail on fake SIDs).
 					this.isSimulated =
-						params.simulated === "true" ||
-						this.callSid.startsWith("CA_SIM");
+						params.simulated === "true" || this.callSid.startsWith("CA_SIM");
 
 					// Ensure person exists (idempotent — /incoming-call likely already started this).
 					if (this.callerPhone) {
-						void ensurePersonRow(this.callerPhone).then((id) => {
-							this.personId = id;
-							if (id != null) {
-								this.logger.info({ personId: id }, "👤 Person upserted");
+						void ensurePersonRow(this.callerPhone).then((row) => {
+							if (row != null) {
+								this.applyPersonRow(row);
+								this.sendSessionConfig();
+							} else {
+								this.markPersonProfileResolvedWithoutRow();
 							}
+							this.trySendInitialGreeting();
 						});
+					} else {
+						this.markPersonProfileResolvedWithoutRow();
+						this.trySendInitialGreeting();
 					}
 
 					// Ensure DB row exists (idempotent — /incoming-call likely already started this).
@@ -772,6 +925,7 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 					if (this.markQueue.length > 0) {
 						this.markQueue.shift();
 					}
+					this.tryScheduleHangupAfterPlayback();
 					break;
 
 				case "stop":
@@ -803,7 +957,6 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 			}),
 		);
 
-		// Track playback timing for interruption handling
 		if (this.responseStartTimestampTwilio === null) {
 			this.responseStartTimestampTwilio = this.latestMediaTimestamp;
 		}
@@ -839,6 +992,7 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 
 	/** Handle interruption: patient starts speaking while AI is responding */
 	private handleSpeechStarted() {
+		if (this.pendingHangup) return;
 		if (
 			this.markQueue.length > 0 &&
 			this.responseStartTimestampTwilio != null
@@ -894,57 +1048,116 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 		this.openAIWs.send(JSON.stringify({ type: "response.create" }));
 	}
 
-	private scheduleTwilioHangup() {
+	private onResponseDone() {
+		if (this.skipNextResponseDoneForEndCall) {
+			this.skipNextResponseDoneForEndCall = false;
+			return;
+		}
+		if (this.pendingHangup) {
+			this.hangupAfterPlayback = true;
+			this.tryScheduleHangupAfterPlayback();
+		}
+	}
+
+	private disableTurnDetectionForClosing() {
+		if (this.openAIWs?.readyState !== WebSocket.OPEN) return;
+		this.openAIWs.send(
+			JSON.stringify({
+				type: "session.update",
+				session: {
+					turn_detection: {
+						type: "server_vad",
+						threshold: SESSION_CONFIG.turn_detection.threshold,
+						silence_duration_ms:
+							SESSION_CONFIG.turn_detection.silence_duration_ms,
+						interrupt_response: false,
+						create_response: false,
+					},
+				},
+			}),
+		);
+	}
+
+	private tryScheduleHangupAfterPlayback() {
+		if (!this.hangupAfterPlayback || this.hangupScheduled) return;
+		if (this.markQueue.length > 0) return;
+		const delay = parseInt(process.env.END_CALL_DELAY_MS || "800", 10);
+		this.scheduleTwilioHangup(delay);
+	}
+
+	private scheduleFallbackHangup() {
+		if (this.fallbackHangupTimer) return;
+		const maxWait = parseInt(process.env.END_CALL_MAX_WAIT_MS || "12000", 10);
+		this.fallbackHangupTimer = setTimeout(() => {
+			this.fallbackHangupTimer = null;
+			this.logger.warn(
+				{ callSid: this.callSid },
+				"📴 Fallback hangup after closing wait",
+			);
+			this.scheduleTwilioHangup(0);
+		}, maxWait);
+	}
+
+	private clearHangupTimers() {
+		if (this.hangupTimer) {
+			clearTimeout(this.hangupTimer);
+			this.hangupTimer = null;
+		}
+		if (this.fallbackHangupTimer) {
+			clearTimeout(this.fallbackHangupTimer);
+			this.fallbackHangupTimer = null;
+		}
+	}
+
+	private scheduleTwilioHangup(delayMs?: number) {
 		if (this.hangupScheduled) return;
 		this.hangupScheduled = true;
-		const delay = parseInt(process.env.END_CALL_DELAY_MS || "2500", 10);
+		this.clearHangupTimers();
+		const delay =
+			delayMs ?? parseInt(process.env.END_CALL_DELAY_MS || "800", 10);
 		const callSid = this.callSid;
 
-		// Simulated browser calls: close the media WebSocket instead of the
-		// Twilio REST API (which would 404 on fake CA_SIM* SIDs).
+		this.logger.info(
+			{ callSid, delayMs: delay, simulated: this.isSimulated },
+			"📴 Scheduling call hangup",
+		);
+		this.hangupTimer = setTimeout(() => {
+			this.hangupTimer = null;
+			this.executeHangup(callSid);
+		}, delay);
+	}
+
+	private executeHangup(callSid: string | null) {
 		if (this.isSimulated) {
-			this.logger.info(
-				{ callSid, delayMs: delay },
-				"📴 Scheduling simulated call WS close",
-			);
-			setTimeout(() => {
-				this.logger.info({ callSid }, "📴 Closing simulated call WebSocket");
+			this.logger.info({ callSid }, "📴 Closing simulated call WebSocket");
+			try {
+				this.twilioWs.close();
+			} catch {
+				// already closed
+			}
+			return;
+		}
+
+		const client = getTwilioRestClient();
+		if (!callSid || !client) {
+			this.hangupScheduled = false;
+			return;
+		}
+		client
+			.calls(callSid)
+			.update({ status: "completed" })
+			.then(() => {
+				this.logger.info({ callSid }, "📴 Twilio call ended");
+			})
+			.catch((err: unknown) => {
+				this.hangupScheduled = false;
+				this.logger.error({ err, callSid }, "🔥 Failed to end Twilio call");
 				try {
 					this.twilioWs.close();
 				} catch {
 					// already closed
 				}
-			}, delay);
-			return;
-		}
-
-		const client = getTwilioRestClient();
-		this.logger.info(
-			{ callSid, delayMs: delay },
-			"📴 Scheduling Twilio call completion",
-		);
-		setTimeout(() => {
-			if (!callSid || !client) {
-				this.hangupScheduled = false;
-				return;
-			}
-			client
-				.calls(callSid)
-				.update({ status: "completed" })
-				.then(() => {
-					this.logger.info({ callSid }, "📴 Twilio call ended");
-				})
-				.catch((err: unknown) => {
-					this.hangupScheduled = false;
-					this.logger.error({ err, callSid }, "🔥 Failed to end Twilio call");
-					// Fallback: close the WS so the session still ends
-					try {
-						this.twilioWs.close();
-					} catch {
-						// already closed
-					}
-				});
-		}, delay);
+			});
 	}
 
 	private async handleFunctionCall(event: {
@@ -1068,17 +1281,28 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 							error: true,
 							message: "end_call: no active call",
 						});
-					} else if (!this.isSimulated && (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN)) {
+					} else if (
+						!this.isSimulated &&
+						(!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN)
+					) {
 						result = JSON.stringify({
 							error: true,
 							message: "end_call: Twilio credentials not configured",
 						});
 					} else {
 						scheduleHangupAfterOutput = true;
+						const lang = normalizeCallLanguage(
+							(parsedArgs as { language?: string }).language,
+						);
+						const langHint =
+							lang === "fr"
+								? "French"
+								: lang === "en"
+									? "English"
+									: "Tunisian Arabic (Derja)";
 						result = JSON.stringify({
 							success: true,
-							message:
-								"Hangup scheduled. Do not speak again; the call will disconnect shortly.",
+							message: `Call disconnect is scheduled when this response finishes. Say a brief thank-you and goodbye to the patient now (one short sentence, ${langHint}). Do not call other tools.`,
 						});
 					}
 					break;
@@ -1127,11 +1351,34 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 						result = JSON.stringify({
 							error: true,
 							message:
-								"update_person_info: invalid arguments (expected at least one of first_name, last_name, date_of_birth, gender, address)",
+								"update_person_info: invalid arguments (expected at least one of first_name, last_name, date_of_birth, gender, address, preferred_language)",
 						});
 						break;
 					}
 					result = await this.updatePersonInfo(personArgs);
+					break;
+				}
+				case "list_my_ai_appointments": {
+					const includeRecentPast =
+						parsedArgs !== null &&
+						typeof parsedArgs === "object" &&
+						!Array.isArray(parsedArgs) &&
+						(parsedArgs as { include_recent_past?: boolean })
+							.include_recent_past === true;
+					result = await this.listMyAiAppointments({ includeRecentPast });
+					break;
+				}
+				case "cancel_appointment": {
+					const cancelArgs = normalizeCancelAppointmentArgs(parsedArgs);
+					if (!cancelArgs) {
+						result = JSON.stringify({
+							error: true,
+							message:
+								"cancel_appointment: invalid arguments (expected appointment_id)",
+						});
+						break;
+					}
+					result = await this.cancelAppointment(cancelArgs.appointmentId);
 					break;
 				}
 				default:
@@ -1198,9 +1445,15 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 			}
 
 			this.sendFunctionCallOutput(call_id, result, {
-				continueConversation: !scheduleHangupAfterOutput,
+				continueConversation: true,
 			});
-			if (scheduleHangupAfterOutput) this.scheduleTwilioHangup();
+
+			if (scheduleHangupAfterOutput) {
+				this.pendingHangup = true;
+				this.skipNextResponseDoneForEndCall = true;
+				this.disableTurnDetectionForClosing();
+				this.scheduleFallbackHangup();
+			}
 		} catch (error: unknown) {
 			consoleLogToolHttpError(
 				name,
@@ -1477,6 +1730,77 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 		});
 	}
 
+	private async listMyAiAppointments(options?: {
+		includeRecentPast?: boolean;
+	}): Promise<string> {
+		const callerRaw = this.callerPhone?.trim();
+		if (!callerRaw) {
+			return JSON.stringify({
+				error: true,
+				message: "list_my_ai_appointments: no caller phone on this call",
+			});
+		}
+		const data = await listCallerAiAppointments(callerRaw, {
+			includeRecentPast: options?.includeRecentPast,
+		});
+		return JSON.stringify({
+			found:
+				data.upcoming.length > 0 || data.recentPast.length > 0,
+			upcoming: data.upcoming,
+			recentPast: data.recentPast,
+			message:
+				"Times are UTC in JSON; tell the patient times in Tunisia GMT+1. For confirmed appointments, cancellation by phone is not allowed — patient must contact the doctor.",
+		});
+	}
+
+	private async cancelAppointment(appointmentId: number): Promise<string> {
+		const callerRaw = this.callerPhone?.trim();
+		if (!callerRaw) {
+			return JSON.stringify({
+				error: true,
+				message: "cancel_appointment: no caller phone on this call",
+			});
+		}
+		try {
+			const data = await cancelCallerAiAppointment(callerRaw, appointmentId);
+			return JSON.stringify({
+				success: true,
+				appointment_id: data.appointmentId,
+				status: data.status,
+				message: "Appointment cancelled successfully.",
+			});
+		} catch (error: unknown) {
+			const code =
+				error &&
+				typeof error === "object" &&
+				"response" in error &&
+				error.response &&
+				typeof error.response === "object" &&
+				"data" in error.response &&
+				error.response.data &&
+				typeof error.response.data === "object" &&
+				"error" in error.response.data
+					? String((error.response.data as { error: unknown }).error)
+					: undefined;
+			if (code === "APPOINTMENT_NOT_CANCELLABLE") {
+				return JSON.stringify({
+					error: true,
+					code,
+					message:
+						"This appointment is already confirmed. The patient must contact the doctor's office to cancel or change it.",
+				});
+			}
+			if (code === "FORBIDDEN" || code === "APPOINTMENT_NOT_FOUND") {
+				return JSON.stringify({
+					error: true,
+					code,
+					message: "That appointment was not found for this caller.",
+				});
+			}
+			throw error;
+		}
+	}
+
 	private async bookAppointment(
 		params: BookAppointmentToolArgs,
 	): Promise<string> {
@@ -1612,7 +1936,8 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 			console.log(
 				"-------------------------------------------------------------",
 			);
-			this.personId = await ensurePersonRow(this.callerPhone);
+			const row = await ensurePersonRow(this.callerPhone);
+			if (row != null) this.applyPersonRow(row);
 		}
 
 		if (this.personId == null) {
@@ -1648,6 +1973,16 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 		console.log(
 			"-------------------------------------------------------------",
 		);
+
+		if (params.firstName?.trim()) {
+			this.callerFirstName = params.firstName.trim();
+		}
+		if (params.preferredLanguage) {
+			this.callerPreferredLanguage = params.preferredLanguage;
+		}
+		if (params.firstName || params.preferredLanguage) {
+			this.sendSessionConfig();
+		}
 
 		return JSON.stringify({
 			success: true,
@@ -1694,6 +2029,7 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 
 	dispose() {
 		this.logger.info("🗑️ Disposing TwilioSession");
+		this.clearHangupTimers();
 
 		if (this.openAIWs) {
 			this.openAIWs.removeAllListeners();
