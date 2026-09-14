@@ -65,6 +65,20 @@ const SESSION_CONFIG = {
 	),
 };
 
+/** Spoken verbatim after `end_call` (no model-authored goodbye). */
+type CallLanguage = "en" | "fr" | "ar";
+
+const CLOSING_PHRASES: Record<CallLanguage, string> = {
+	en: "Thank you for using Riaya. Goodbye.",
+	fr: "Merci d'avoir utilisé Riaya. Au revoir.",
+	ar: "مرحبا بيك في رعاية. بالسلامة",
+};
+
+function normalizeCallLanguage(raw: unknown): CallLanguage {
+	if (raw === "en" || raw === "fr" || raw === "ar") return raw;
+	return "en";
+}
+
 // ==================== Tool / HTTP logging ====================
 
 const MAX_LOG_CHARS = 8000;
@@ -377,6 +391,16 @@ export class TwilioSession {
 
 	/** Avoid stacking multiple Twilio REST hangups for one session. */
 	private hangupScheduled = false;
+	/** `end_call` was invoked; hang up after closing audio has played. */
+	private pendingHangup = false;
+	/** Closing speech has finished generating; hang up once Twilio marks drain. */
+	private hangupAfterPlayback = false;
+	/** After the current tool response finishes, speak a goodbye before hangup. */
+	private closingSpeechNeeded = false;
+	/** Language for the fixed closing phrase (from `end_call`). */
+	private closingLanguage: CallLanguage = "en";
+	private hangupTimer: ReturnType<typeof setTimeout> | null = null;
+	private fallbackHangupTimer: ReturnType<typeof setTimeout> | null = null;
 
 	/**
 	 * True when the call originates from the browser test-call page rather than
@@ -609,7 +633,10 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 				[EVENTS.ResponseFunctionCallArgumentsDone]: (e) =>
 					this.handleFunctionCall(e),
 
-				[EVENTS.ResponseDone]: () => this.logger.debug("✅ Response complete"),
+				[EVENTS.ResponseDone]: () => {
+					this.logger.debug("✅ Response complete");
+					this.onResponseDone();
+				},
 
 				[EVENTS.Error]: (e) => {
 					this.logger.error({ error: e.error }, "🔥 OpenAI error");
@@ -704,8 +731,7 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 					// Detect simulated browser calls so hangup closes the WS instead
 					// of calling the Twilio REST API (which would fail on fake SIDs).
 					this.isSimulated =
-						params.simulated === "true" ||
-						this.callSid.startsWith("CA_SIM");
+						params.simulated === "true" || this.callSid.startsWith("CA_SIM");
 
 					// Ensure person exists (idempotent — /incoming-call likely already started this).
 					if (this.callerPhone) {
@@ -772,6 +798,7 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 					if (this.markQueue.length > 0) {
 						this.markQueue.shift();
 					}
+					this.tryScheduleHangupAfterPlayback();
 					break;
 
 				case "stop":
@@ -803,7 +830,6 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 			}),
 		);
 
-		// Track playback timing for interruption handling
 		if (this.responseStartTimestampTwilio === null) {
 			this.responseStartTimestampTwilio = this.latestMediaTimestamp;
 		}
@@ -839,6 +865,7 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 
 	/** Handle interruption: patient starts speaking while AI is responding */
 	private handleSpeechStarted() {
+		if (this.pendingHangup) return;
 		if (
 			this.markQueue.length > 0 &&
 			this.responseStartTimestampTwilio != null
@@ -894,57 +921,148 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 		this.openAIWs.send(JSON.stringify({ type: "response.create" }));
 	}
 
-	private scheduleTwilioHangup() {
+	private onResponseDone() {
+		if (this.pendingHangup && this.closingSpeechNeeded) {
+			this.closingSpeechNeeded = false;
+			this.sendClosingSpeech();
+			return;
+		}
+		if (this.pendingHangup) {
+			this.hangupAfterPlayback = true;
+			this.tryScheduleHangupAfterPlayback();
+		}
+	}
+
+	private disableTurnDetectionForClosing() {
+		if (this.openAIWs?.readyState !== WebSocket.OPEN) return;
+		this.openAIWs.send(
+			JSON.stringify({
+				type: "session.update",
+				session: {
+					turn_detection: {
+						type: "server_vad",
+						threshold: SESSION_CONFIG.turn_detection.threshold,
+						silence_duration_ms:
+							SESSION_CONFIG.turn_detection.silence_duration_ms,
+						interrupt_response: false,
+						create_response: false,
+					},
+				},
+			}),
+		);
+	}
+
+	private sendClosingSpeech() {
+		if (this.openAIWs?.readyState !== WebSocket.OPEN) {
+			this.scheduleTwilioHangup(0);
+			return;
+		}
+		const text = CLOSING_PHRASES[this.closingLanguage];
+		this.openAIWs.send(
+			JSON.stringify({
+				type: "response.create",
+				response: {
+					conversation: "none",
+					modalities: ["text", "audio"],
+					tool_choice: "none",
+					instructions:
+						"Text-to-speech only. Read the user message aloud verbatim. Do not add, remove, or change any words.",
+					input: [
+						{
+							type: "message",
+							role: "user",
+							content: [{ type: "input_text", text }],
+						},
+					],
+				},
+			}),
+		);
+		this.logger.info(
+			{ language: this.closingLanguage, text },
+			"🗣️ Closing phrase (verbatim TTS)",
+		);
+	}
+
+	private tryScheduleHangupAfterPlayback() {
+		if (!this.hangupAfterPlayback || this.hangupScheduled) return;
+		if (this.markQueue.length > 0) return;
+		const delay = parseInt(process.env.END_CALL_DELAY_MS || "800", 10);
+		this.scheduleTwilioHangup(delay);
+	}
+
+	private scheduleFallbackHangup() {
+		if (this.fallbackHangupTimer) return;
+		const maxWait = parseInt(process.env.END_CALL_MAX_WAIT_MS || "12000", 10);
+		this.fallbackHangupTimer = setTimeout(() => {
+			this.fallbackHangupTimer = null;
+			this.logger.warn(
+				{ callSid: this.callSid },
+				"📴 Fallback hangup after closing wait",
+			);
+			this.scheduleTwilioHangup(0);
+		}, maxWait);
+	}
+
+	private clearHangupTimers() {
+		if (this.hangupTimer) {
+			clearTimeout(this.hangupTimer);
+			this.hangupTimer = null;
+		}
+		if (this.fallbackHangupTimer) {
+			clearTimeout(this.fallbackHangupTimer);
+			this.fallbackHangupTimer = null;
+		}
+	}
+
+	private scheduleTwilioHangup(delayMs?: number) {
 		if (this.hangupScheduled) return;
 		this.hangupScheduled = true;
-		const delay = parseInt(process.env.END_CALL_DELAY_MS || "2500", 10);
+		this.clearHangupTimers();
+		const delay =
+			delayMs ?? parseInt(process.env.END_CALL_DELAY_MS || "800", 10);
 		const callSid = this.callSid;
 
-		// Simulated browser calls: close the media WebSocket instead of the
-		// Twilio REST API (which would 404 on fake CA_SIM* SIDs).
+		this.logger.info(
+			{ callSid, delayMs: delay, simulated: this.isSimulated },
+			"📴 Scheduling call hangup",
+		);
+		this.hangupTimer = setTimeout(() => {
+			this.hangupTimer = null;
+			this.executeHangup(callSid);
+		}, delay);
+	}
+
+	private executeHangup(callSid: string | null) {
 		if (this.isSimulated) {
-			this.logger.info(
-				{ callSid, delayMs: delay },
-				"📴 Scheduling simulated call WS close",
-			);
-			setTimeout(() => {
-				this.logger.info({ callSid }, "📴 Closing simulated call WebSocket");
+			this.logger.info({ callSid }, "📴 Closing simulated call WebSocket");
+			try {
+				this.twilioWs.close();
+			} catch {
+				// already closed
+			}
+			return;
+		}
+
+		const client = getTwilioRestClient();
+		if (!callSid || !client) {
+			this.hangupScheduled = false;
+			return;
+		}
+		client
+			.calls(callSid)
+			.update({ status: "completed" })
+			.then(() => {
+				this.logger.info({ callSid }, "📴 Twilio call ended");
+			})
+			.catch((err: unknown) => {
+				this.hangupScheduled = false;
+				this.logger.error({ err, callSid }, "🔥 Failed to end Twilio call");
 				try {
 					this.twilioWs.close();
 				} catch {
 					// already closed
 				}
-			}, delay);
-			return;
-		}
-
-		const client = getTwilioRestClient();
-		this.logger.info(
-			{ callSid, delayMs: delay },
-			"📴 Scheduling Twilio call completion",
-		);
-		setTimeout(() => {
-			if (!callSid || !client) {
-				this.hangupScheduled = false;
-				return;
-			}
-			client
-				.calls(callSid)
-				.update({ status: "completed" })
-				.then(() => {
-					this.logger.info({ callSid }, "📴 Twilio call ended");
-				})
-				.catch((err: unknown) => {
-					this.hangupScheduled = false;
-					this.logger.error({ err, callSid }, "🔥 Failed to end Twilio call");
-					// Fallback: close the WS so the session still ends
-					try {
-						this.twilioWs.close();
-					} catch {
-						// already closed
-					}
-				});
-		}, delay);
+			});
 	}
 
 	private async handleFunctionCall(event: {
@@ -1068,17 +1186,23 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 							error: true,
 							message: "end_call: no active call",
 						});
-					} else if (!this.isSimulated && (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN)) {
+					} else if (
+						!this.isSimulated &&
+						(!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN)
+					) {
 						result = JSON.stringify({
 							error: true,
 							message: "end_call: Twilio credentials not configured",
 						});
 					} else {
 						scheduleHangupAfterOutput = true;
+						this.closingLanguage = normalizeCallLanguage(
+							(parsedArgs as { language?: string }).language,
+						);
 						result = JSON.stringify({
 							success: true,
 							message:
-								"Hangup scheduled. Do not speak again; the call will disconnect shortly.",
+								"Hangup pending. A fixed thank-you/goodbye will be spoken; do not add a goodbye yourself.",
 						});
 					}
 					break;
@@ -1200,7 +1324,12 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 			this.sendFunctionCallOutput(call_id, result, {
 				continueConversation: !scheduleHangupAfterOutput,
 			});
-			if (scheduleHangupAfterOutput) this.scheduleTwilioHangup();
+			if (scheduleHangupAfterOutput) {
+				this.pendingHangup = true;
+				this.closingSpeechNeeded = true;
+				this.disableTurnDetectionForClosing();
+				this.scheduleFallbackHangup();
+			}
 		} catch (error: unknown) {
 			consoleLogToolHttpError(
 				name,
@@ -1694,6 +1823,7 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 
 	dispose() {
 		this.logger.info("🗑️ Disposing TwilioSession");
+		this.clearHangupTimers();
 
 		if (this.openAIWs) {
 			this.openAIWs.removeAllListeners();
