@@ -15,7 +15,6 @@ const connection = new Redis(
 		maxRetriesPerRequest: null,
 	},
 );
-const APP_URL = process.env.NEXTJS_API_URL || "http://localhost:3000";
 
 export const reviewWorker = new Worker(
 	"review-queue",
@@ -40,11 +39,9 @@ export const reviewWorker = new Worker(
 			const {
 				success,
 				reason,
-				token,
 				phone,
-				patientName,
-				doctorName,
 				adminId,
+				message,
 			} = response.data;
 
 			if (!success) {
@@ -92,8 +89,13 @@ export const reviewWorker = new Worker(
 				throw quotaErr;
 			}
 
-			const link = `${APP_URL}/review/${token}`;
-			const message = `Hi ${patientName}, thanks for visiting ${doctorName}. Please take 30 seconds to answer 3 quick questions about your visit:\n\n${link}`;
+			if (!message) {
+				logger.error(
+					{ appointmentId },
+					"[ReviewWorker] Missing localized message, cannot send",
+				);
+				return;
+			}
 
 			await waService.sendMessage(phone, message);
 			logger.info(
