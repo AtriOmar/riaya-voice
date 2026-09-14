@@ -12,12 +12,14 @@ import express, {
 import { pino } from "pino";
 import { type WebSocket, WebSocketServer } from "ws";
 import { ensureCallRow } from "./api/callsApi.js";
+import { nextjsApi } from "./api/nextjsApiClient.js";
 import { ensurePersonRow } from "./api/personsApi.js";
 import { whatsappManager } from "./services/whatsappManager.js";
 import type { WhatsappStatus } from "./services/whatsappService.js";
 import { getSystemMessage } from "./sessions/systemMessages.js";
 import { TwilioSession } from "./sessions/twilioSession.js";
 import "./workers/reviewWorker.js"; // Start the review worker
+import "./workers/subscriptionWorker.js"; // Start the subscription cron worker
 
 const PORT = process.env.PORT || 8080;
 
@@ -67,18 +69,40 @@ app.get("/whatsapp-status", (req: Request, res: Response) => {
 	res.json(whatsappManager.getService(userId).getStatus());
 });
 
-// Send a WhatsApp message — called by web-ts appointment/prescription flow
-// Body: { userId: string; phone: string; message?: string; documentUrl?: string; fileName?: string }
+// Log out of WhatsApp and clear auth so a different account can be linked
+// Body: { userId?: string }  (defaults to "admin")
+app.post("/whatsapp-logout", async (req: Request, res: Response) => {
+	const userId =
+		(req.body as { userId?: string } | undefined)?.userId?.trim() || "admin";
+	try {
+		await whatsappManager.getService(userId).logout();
+		res.json({ ok: true });
+	} catch (err) {
+		logger.error({ err, userId }, "🔥 [WhatsApp] Logout failed");
+		res.status(500).json({ error: "Failed to log out of WhatsApp" });
+	}
+});
+
+// Send a WhatsApp message — called by web appointment/invoice/file flows
+// Body: { userId, phone, message?, documentUrl?, fileName?, mimetype?, quotaConsumed? }
 app.post("/send-whatsapp", async (req: Request, res: Response) => {
-	const { userId, phone, message, documentUrl, fileName, mimetype } =
-		req.body as {
-			userId?: string;
-			phone?: string;
-			message?: string;
-			documentUrl?: string;
-			fileName?: string;
-			mimetype?: string;
-		};
+	const {
+		userId,
+		phone,
+		message,
+		documentUrl,
+		fileName,
+		mimetype,
+		quotaConsumed,
+	} = req.body as {
+		userId?: string;
+		phone?: string;
+		message?: string;
+		documentUrl?: string;
+		fileName?: string;
+		mimetype?: string;
+		quotaConsumed?: boolean;
+	};
 	if (!phone) {
 		res.status(400).json({ error: "phone is required" });
 		return;
@@ -89,6 +113,31 @@ app.post("/send-whatsapp", async (req: Request, res: Response) => {
 	}
 	const resolvedUserId = userId?.trim() || "admin";
 	try {
+		// Enforce plan limit unless the web app already consumed quota
+		if (!quotaConsumed && resolvedUserId !== "admin") {
+			try {
+				await nextjsApi.post(
+					"/api/internal/billing/consume-whatsapp",
+					{ userId: resolvedUserId, count: 1 },
+					{
+						headers: {
+							"x-internal-secret": process.env.INTERNAL_API_SECRET ?? "",
+						},
+					},
+				);
+			} catch (quotaErr: unknown) {
+				const ax = quotaErr as {
+					response?: { status?: number; data?: { error?: string } };
+				};
+				const code = ax.response?.data?.error;
+				if (code === "WHATSAPP_LIMIT_REACHED") {
+					res.status(403).json({ error: "WHATSAPP_LIMIT_REACHED" });
+					return;
+				}
+				throw quotaErr;
+			}
+		}
+
 		const service = whatsappManager.getService(resolvedUserId);
 		if (documentUrl) {
 			await service.sendDocument(
@@ -291,6 +340,8 @@ whatsappWss.on("connection", (ws: WebSocket, request) => {
 			};
 			if (msg.type === "send_message" && msg.phone && msg.message) {
 				await service.sendMessage(msg.phone, msg.message);
+			} else if (msg.type === "logout") {
+				await service.logout();
 			} else if (msg.type === "request_qr" || msg.type === "reconnect") {
 				await service.connect();
 			}
