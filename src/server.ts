@@ -18,6 +18,7 @@ import type { WhatsappStatus } from "./services/whatsappService.js";
 import { getSystemMessage } from "./sessions/systemMessages.js";
 import { TwilioSession } from "./sessions/twilioSession.js";
 import "./workers/reviewWorker.js"; // Start the review worker
+import "./workers/subscriptionWorker.js"; // Start the subscription cron worker
 
 const PORT = process.env.PORT || 8080;
 
