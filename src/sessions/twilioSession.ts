@@ -5,6 +5,10 @@ import twilio from "twilio";
 import { type RawData, WebSocket } from "ws";
 import { createCallEvent, ensureCallRow, updateCall } from "../api/callsApi.js";
 import { nextjsApi } from "../api/nextjsApiClient.js";
+import {
+	cancelCallerAiAppointment,
+	listCallerAiAppointments,
+} from "../api/callerAppointmentsApi.js";
 import { ensurePersonRow, updatePersonRow } from "../api/personsApi.js";
 import { CITIES } from "../constants/cities.js";
 import { SPECIALITIES } from "../constants/specialities.js";
@@ -65,18 +69,32 @@ const SESSION_CONFIG = {
 	),
 };
 
-/** Spoken verbatim after `end_call` (no model-authored goodbye). */
 type CallLanguage = "en" | "fr" | "ar";
 
-const CLOSING_PHRASES: Record<CallLanguage, string> = {
-	en: "Thank you for using Riaya. Goodbye.",
-	fr: "Merci d'avoir utilisé Riaya. Au revoir.",
-	ar: "مرحبا بيك في رعاية. بالسلامة",
-};
+function buildInitialGreetingInstructions(
+	lang: CallLanguage,
+	firstName?: string | null,
+): string {
+	const name = firstName?.trim();
+	const withName = name && name.length > 0;
+	if (lang === "fr") {
+		return withName
+			? `Say exactly one short sentence in French greeting ${name} by first name, introduce yourself as Riaya, and ask how you can help. Do NOT mention appointments. Do NOT call any functions.`
+			: 'Say exactly one short sentence in French: "Bonjour, ici Riaya. Comment puis-je vous aider?" Do NOT call any functions.';
+	}
+	if (lang === "ar") {
+		return withName
+			? `Say exactly one short sentence in Tunisian Arabic (Derja): "أهلا ${name}، معاك رعاية. شنوّا نجم نعاونك?" Do NOT mention appointments. Do NOT call any functions.`
+			: 'Say exactly one short sentence in Tunisian Arabic (Derja): "أهلا، معاك رعاية. شنوّا نجم نعاونك?" Do NOT call any functions.';
+	}
+	return withName
+		? `Say exactly one short sentence greeting ${name} by first name, say "Hello, this is Riaya," and ask how you can help. Do NOT mention appointments. Do NOT call any functions.`
+		: 'Say exactly one short sentence: "Hello, this is Riaya. How can I help you?" Do NOT call any functions.';
+}
 
 function normalizeCallLanguage(raw: unknown): CallLanguage {
 	if (raw === "en" || raw === "fr" || raw === "ar") return raw;
-	return "en";
+	return "ar";
 }
 
 // ==================== Tool / HTTP logging ====================
@@ -179,6 +197,7 @@ type UpdatePersonInfoToolArgs = {
 	dateOfBirth?: string;
 	gender?: string;
 	address?: string;
+	preferredLanguage?: CallLanguage;
 };
 
 function strField(
@@ -311,13 +330,25 @@ function normalizeUpdatePersonInfoArgs(
 	const dateOfBirth = strField(o, "date_of_birth", "dateOfBirth");
 	const gender = strField(o, "gender", "gender");
 	const address = strField(o, "address", "address");
+	const preferredLanguageRaw = strField(
+		o,
+		"preferred_language",
+		"preferredLanguage",
+	);
+	const preferredLanguage =
+		preferredLanguageRaw === "en" ||
+		preferredLanguageRaw === "fr" ||
+		preferredLanguageRaw === "ar"
+			? preferredLanguageRaw
+			: undefined;
 
 	if (
 		firstName === undefined &&
 		lastName === undefined &&
 		dateOfBirth === undefined &&
 		gender === undefined &&
-		address === undefined
+		address === undefined &&
+		preferredLanguage === undefined
 	) {
 		return null;
 	}
@@ -328,7 +359,31 @@ function normalizeUpdatePersonInfoArgs(
 		...(dateOfBirth !== undefined ? { dateOfBirth } : {}),
 		...(gender !== undefined ? { gender } : {}),
 		...(address !== undefined ? { address } : {}),
+		...(preferredLanguage !== undefined ? { preferredLanguage } : {}),
 	};
+}
+
+function normalizeCancelAppointmentArgs(
+	raw: unknown,
+): { appointmentId: number } | null {
+	if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+		return null;
+	const o = raw as Record<string, unknown>;
+	const idRaw = o.appointment_id ?? o.appointmentId;
+	let appointmentId: number | null = null;
+	if (typeof idRaw === "number") appointmentId = idRaw;
+	if (typeof idRaw === "string" && idRaw.trim() !== "") {
+		const parsed = Number(idRaw);
+		if (Number.isFinite(parsed)) appointmentId = parsed;
+	}
+	if (
+		appointmentId === null ||
+		!Number.isInteger(appointmentId) ||
+		appointmentId <= 0
+	) {
+		return null;
+	}
+	return { appointmentId };
 }
 
 // ==================== OpenAI Realtime Event Types ====================
@@ -384,6 +439,13 @@ export class TwilioSession {
 
 	/** Only the first session.update should trigger the opening greeting */
 	private initialGreetingSent = false;
+	/** Twilio media `start` received — callerPhone / person lookup may still be in flight. */
+	private twilioStreamStarted = false;
+	/** Loaded from person row (or default ar) before first greeting when possible. */
+	private personProfileResolved = false;
+	/** Saved preference + active call language (default Arabic). */
+	private callerPreferredLanguage: CallLanguage = "ar";
+	private callerFirstName: string | null = null;
 
 	/** Next.js DB row id for this call (available once ensureCallRow resolves). */
 	private dbCallIdPromise: Promise<number | null> | null = null;
@@ -391,14 +453,12 @@ export class TwilioSession {
 
 	/** Avoid stacking multiple Twilio REST hangups for one session. */
 	private hangupScheduled = false;
-	/** `end_call` was invoked; hang up after closing audio has played. */
+	/** `end_call` was invoked; hang up after the assistant goodbye response finishes. */
 	private pendingHangup = false;
-	/** Closing speech has finished generating; hang up once Twilio marks drain. */
+	/** Ignore the next `response.done` (the turn that invoked `end_call`); hang up after the following one. */
+	private skipNextResponseDoneForEndCall = false;
+	/** Goodbye audio has finished generating; hang up once Twilio marks drain. */
 	private hangupAfterPlayback = false;
-	/** After the current tool response finishes, speak a goodbye before hangup. */
-	private closingSpeechNeeded = false;
-	/** Language for the fixed closing phrase (from `end_call`). */
-	private closingLanguage: CallLanguage = "en";
 	private hangupTimer: ReturnType<typeof setTimeout> | null = null;
 	private fallbackHangupTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -495,12 +555,68 @@ export class TwilioSession {
 	}
 
 	private buildSessionInstructions(): string {
-		if (!this.callerPhone) return this.systemMessage.message;
-		return `${this.systemMessage.message}
+		const lang = this.callerPreferredLanguage;
+		const langLabel =
+			lang === "en"
+				? "English"
+				: lang === "fr"
+					? "French"
+					: "Tunisian Arabic (Derja)";
+		const knownName = this.callerFirstName?.trim();
+		const profileBlock = knownName
+			? `Known first name: **${knownName}** (use in greeting; you may skip asking for name unless unclear).`
+			: "Name not on file yet — ask for their name early in the booking flow.";
+		let instructions = `${this.systemMessage.message}
+
+## CALLER PROFILE
+${profileBlock}
+Do **not** mention existing appointments in the opening greeting. Use \`list_my_ai_appointments\` only when the patient asks about a booking, doctor, location, time, or cancellation.
+
+## CALLER LANGUAGE PREFERENCE
+Stored preference for this caller: **${lang}** (${langLabel}). **Start and respond in this language** until the patient asks to switch.
+If they ask to speak another supported language (English, French, or Tunisian Derja), switch immediately and call \`update_person_info\` with \`preferred_language\` set to \`en\`, \`fr\`, or \`ar\` (use \`ar\` for Tunisian Derja).`;
+
+		if (!this.callerPhone) return instructions;
+		return `${instructions}
 
 ## CALLER PHONE (THIS LINE)
 The phone number for this call is: **${this.callerPhone}**.
-The server uses this number automatically when \`book_appointment\` runs. Do **not** ask the patient about their phone number.`;
+The server uses this number automatically when \`book_appointment\`, \`list_my_ai_appointments\`, or \`cancel_appointment\` runs. Do **not** ask the patient about their phone number.`;
+	}
+
+	private applyPersonRow(row: {
+		id: number;
+		firstName?: string | null;
+		lastName?: string | null;
+		preferredLanguage?: string | null;
+	}) {
+		this.personId = row.id;
+		this.callerFirstName = row.firstName?.trim() || null;
+		this.callerPreferredLanguage = normalizeCallLanguage(row.preferredLanguage);
+		this.personProfileResolved = true;
+		this.logger.info(
+			{
+				personId: row.id,
+				preferredLanguage: this.callerPreferredLanguage,
+				hasFirstName: Boolean(this.callerFirstName),
+			},
+			"👤 Person profile applied",
+		);
+	}
+
+	private markPersonProfileResolvedWithoutRow() {
+		this.personProfileResolved = true;
+	}
+
+	private trySendInitialGreeting() {
+		if (this.initialGreetingSent) return;
+		if (this.openAIWs?.readyState !== WebSocket.OPEN) return;
+		// OpenAI often reaches SessionUpdated before Twilio `start`; wait so we can load name/lang.
+		if (!this.twilioStreamStarted) return;
+		if (!this.personProfileResolved) return;
+
+		this.initialGreetingSent = true;
+		this.sendInitialGreeting();
 	}
 
 	private sendSessionConfig() {
@@ -525,16 +641,23 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 	private sendInitialGreeting() {
 		if (this.openAIWs?.readyState !== WebSocket.OPEN) return;
 
+		const instructions = buildInitialGreetingInstructions(
+			this.callerPreferredLanguage,
+			this.callerFirstName,
+		);
 		this.openAIWs.send(
 			JSON.stringify({
 				type: "response.create",
 				response: {
 					modalities: ["text", "audio"],
-					instructions: this.systemMessage.initialInstructions,
+					instructions,
 				},
 			}),
 		);
-		this.logger.info("🗣️ Initial greeting triggered");
+		this.logger.info(
+			{ language: this.callerPreferredLanguage },
+			"🗣️ Initial greeting triggered",
+		);
 	}
 
 	// ==================== OpenAI Event Handlers ====================
@@ -567,10 +690,7 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 
 				[EVENTS.SessionUpdated]: () => {
 					this.logger.info("✅ Session config updated");
-					if (!this.initialGreetingSent) {
-						this.initialGreetingSent = true;
-						this.sendInitialGreeting();
-					}
+					this.trySendInitialGreeting();
 				},
 
 				[EVENTS.ResponseAudioDelta]: (e) => this.handleAudioDelta(e),
@@ -715,6 +835,7 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 					break;
 
 				case "start": {
+					this.twilioStreamStarted = true;
 					this.streamSid = msg.streamSid;
 					this.callSid = msg.start.callSid;
 					const params = msg.start.customParameters ?? {};
@@ -735,12 +856,18 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 
 					// Ensure person exists (idempotent — /incoming-call likely already started this).
 					if (this.callerPhone) {
-						void ensurePersonRow(this.callerPhone).then((id) => {
-							this.personId = id;
-							if (id != null) {
-								this.logger.info({ personId: id }, "👤 Person upserted");
+						void ensurePersonRow(this.callerPhone).then((row) => {
+							if (row != null) {
+								this.applyPersonRow(row);
+								this.sendSessionConfig();
+							} else {
+								this.markPersonProfileResolvedWithoutRow();
 							}
+							this.trySendInitialGreeting();
 						});
+					} else {
+						this.markPersonProfileResolvedWithoutRow();
+						this.trySendInitialGreeting();
 					}
 
 					// Ensure DB row exists (idempotent — /incoming-call likely already started this).
@@ -922,9 +1049,8 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 	}
 
 	private onResponseDone() {
-		if (this.pendingHangup && this.closingSpeechNeeded) {
-			this.closingSpeechNeeded = false;
-			this.sendClosingSpeech();
+		if (this.skipNextResponseDoneForEndCall) {
+			this.skipNextResponseDoneForEndCall = false;
 			return;
 		}
 		if (this.pendingHangup) {
@@ -949,37 +1075,6 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 					},
 				},
 			}),
-		);
-	}
-
-	private sendClosingSpeech() {
-		if (this.openAIWs?.readyState !== WebSocket.OPEN) {
-			this.scheduleTwilioHangup(0);
-			return;
-		}
-		const text = CLOSING_PHRASES[this.closingLanguage];
-		this.openAIWs.send(
-			JSON.stringify({
-				type: "response.create",
-				response: {
-					conversation: "none",
-					modalities: ["text", "audio"],
-					tool_choice: "none",
-					instructions:
-						"Text-to-speech only. Read the user message aloud verbatim. Do not add, remove, or change any words.",
-					input: [
-						{
-							type: "message",
-							role: "user",
-							content: [{ type: "input_text", text }],
-						},
-					],
-				},
-			}),
-		);
-		this.logger.info(
-			{ language: this.closingLanguage, text },
-			"🗣️ Closing phrase (verbatim TTS)",
 		);
 	}
 
@@ -1196,13 +1291,18 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 						});
 					} else {
 						scheduleHangupAfterOutput = true;
-						this.closingLanguage = normalizeCallLanguage(
+						const lang = normalizeCallLanguage(
 							(parsedArgs as { language?: string }).language,
 						);
+						const langHint =
+							lang === "fr"
+								? "French"
+								: lang === "en"
+									? "English"
+									: "Tunisian Arabic (Derja)";
 						result = JSON.stringify({
 							success: true,
-							message:
-								"Hangup pending. A fixed thank-you/goodbye will be spoken; do not add a goodbye yourself.",
+							message: `Call disconnect is scheduled when this response finishes. Say a brief thank-you and goodbye to the patient now (one short sentence, ${langHint}). Do not call other tools.`,
 						});
 					}
 					break;
@@ -1251,11 +1351,34 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 						result = JSON.stringify({
 							error: true,
 							message:
-								"update_person_info: invalid arguments (expected at least one of first_name, last_name, date_of_birth, gender, address)",
+								"update_person_info: invalid arguments (expected at least one of first_name, last_name, date_of_birth, gender, address, preferred_language)",
 						});
 						break;
 					}
 					result = await this.updatePersonInfo(personArgs);
+					break;
+				}
+				case "list_my_ai_appointments": {
+					const includeRecentPast =
+						parsedArgs !== null &&
+						typeof parsedArgs === "object" &&
+						!Array.isArray(parsedArgs) &&
+						(parsedArgs as { include_recent_past?: boolean })
+							.include_recent_past === true;
+					result = await this.listMyAiAppointments({ includeRecentPast });
+					break;
+				}
+				case "cancel_appointment": {
+					const cancelArgs = normalizeCancelAppointmentArgs(parsedArgs);
+					if (!cancelArgs) {
+						result = JSON.stringify({
+							error: true,
+							message:
+								"cancel_appointment: invalid arguments (expected appointment_id)",
+						});
+						break;
+					}
+					result = await this.cancelAppointment(cancelArgs.appointmentId);
 					break;
 				}
 				default:
@@ -1322,11 +1445,12 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 			}
 
 			this.sendFunctionCallOutput(call_id, result, {
-				continueConversation: !scheduleHangupAfterOutput,
+				continueConversation: true,
 			});
+
 			if (scheduleHangupAfterOutput) {
 				this.pendingHangup = true;
-				this.closingSpeechNeeded = true;
+				this.skipNextResponseDoneForEndCall = true;
 				this.disableTurnDetectionForClosing();
 				this.scheduleFallbackHangup();
 			}
@@ -1606,6 +1730,77 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 		});
 	}
 
+	private async listMyAiAppointments(options?: {
+		includeRecentPast?: boolean;
+	}): Promise<string> {
+		const callerRaw = this.callerPhone?.trim();
+		if (!callerRaw) {
+			return JSON.stringify({
+				error: true,
+				message: "list_my_ai_appointments: no caller phone on this call",
+			});
+		}
+		const data = await listCallerAiAppointments(callerRaw, {
+			includeRecentPast: options?.includeRecentPast,
+		});
+		return JSON.stringify({
+			found:
+				data.upcoming.length > 0 || data.recentPast.length > 0,
+			upcoming: data.upcoming,
+			recentPast: data.recentPast,
+			message:
+				"Times are UTC in JSON; tell the patient times in Tunisia GMT+1. For confirmed appointments, cancellation by phone is not allowed — patient must contact the doctor.",
+		});
+	}
+
+	private async cancelAppointment(appointmentId: number): Promise<string> {
+		const callerRaw = this.callerPhone?.trim();
+		if (!callerRaw) {
+			return JSON.stringify({
+				error: true,
+				message: "cancel_appointment: no caller phone on this call",
+			});
+		}
+		try {
+			const data = await cancelCallerAiAppointment(callerRaw, appointmentId);
+			return JSON.stringify({
+				success: true,
+				appointment_id: data.appointmentId,
+				status: data.status,
+				message: "Appointment cancelled successfully.",
+			});
+		} catch (error: unknown) {
+			const code =
+				error &&
+				typeof error === "object" &&
+				"response" in error &&
+				error.response &&
+				typeof error.response === "object" &&
+				"data" in error.response &&
+				error.response.data &&
+				typeof error.response.data === "object" &&
+				"error" in error.response.data
+					? String((error.response.data as { error: unknown }).error)
+					: undefined;
+			if (code === "APPOINTMENT_NOT_CANCELLABLE") {
+				return JSON.stringify({
+					error: true,
+					code,
+					message:
+						"This appointment is already confirmed. The patient must contact the doctor's office to cancel or change it.",
+				});
+			}
+			if (code === "FORBIDDEN" || code === "APPOINTMENT_NOT_FOUND") {
+				return JSON.stringify({
+					error: true,
+					code,
+					message: "That appointment was not found for this caller.",
+				});
+			}
+			throw error;
+		}
+	}
+
 	private async bookAppointment(
 		params: BookAppointmentToolArgs,
 	): Promise<string> {
@@ -1741,7 +1936,8 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 			console.log(
 				"-------------------------------------------------------------",
 			);
-			this.personId = await ensurePersonRow(this.callerPhone);
+			const row = await ensurePersonRow(this.callerPhone);
+			if (row != null) this.applyPersonRow(row);
 		}
 
 		if (this.personId == null) {
@@ -1777,6 +1973,16 @@ The server uses this number automatically when \`book_appointment\` runs. Do **n
 		console.log(
 			"-------------------------------------------------------------",
 		);
+
+		if (params.firstName?.trim()) {
+			this.callerFirstName = params.firstName.trim();
+		}
+		if (params.preferredLanguage) {
+			this.callerPreferredLanguage = params.preferredLanguage;
+		}
+		if (params.firstName || params.preferredLanguage) {
+			this.sendSessionConfig();
+		}
 
 		return JSON.stringify({
 			success: true,
