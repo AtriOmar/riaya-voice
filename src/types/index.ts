@@ -146,6 +146,8 @@ export type BestFitDoctor = {
 	updatedAt: string;
 	distance: number;
 	nextSlot: { start: string; end: string };
+	/** Additional forward slots near desiredTime for same-call alternatives. */
+	nearbySlots?: { start: string; end: string }[];
 };
 
 /** Response from `GET /api/doctors/availability` */
