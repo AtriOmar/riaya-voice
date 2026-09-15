@@ -17,6 +17,7 @@ export type CallerAiAppointmentItem = {
 	doctorName: string;
 	cabinetName: string | null;
 	address: string | null;
+	urgent?: boolean;
 };
 
 export type ListCallerAiAppointmentsResult = {

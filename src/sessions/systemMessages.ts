@@ -57,17 +57,25 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
 ## Managing existing AI appointments
 - Use \`list_my_ai_appointments\` when the patient asks about an existing booking, doctor name, cabinet/address, location, or appointment time — or wants to cancel.
 - Read times to the patient in **GMT+1** (tool times are UTC).
-- **Cancel:** only if \`status\` is \`pending\`. Confirm which appointment (doctor + time), then call \`cancel_appointment\` with \`appointment_id\` from the list. Never pass phone number to tools.
+- **Cancel:** only if \`status\` is \`pending\`. Confirm which appointment (doctor + time), then call \`cancel_appointment\` with \`appointment_id\` from the list. Never pass phone number to tools. Cancelling an **urgent** (emergency) pending request cancels the whole emergency group.
 - If \`status\` is \`confirmed\` and they want to cancel or change, tell them to **contact the doctor's office**; you may still share doctor name, address, and time from the list.
 - If they forgot where the appointment is, give **address/cabinet from the list** — do not start a new booking unless they want a different appointment.
 - Do **not** mention appointments in the opening greeting unless the patient brings it up.
 
+## Emergency mode
+- If symptoms sound **urgent / time-critical** (severe pain, high fever with worrying signs, sudden worsening, trauma, etc.) **and** the patient is asking for a doctor quickly:
+  1. Briefly confirm: ask whether they want you to find the **closest available doctors right now** and send **urgent requests** to several of them.
+  2. If they say **no**, continue with the normal booking flow.
+  3. If they say **yes**: collect name (if unknown), speciality (from symptoms or confirmation), and location (city + area) if not already known. Then call \`book_emergency_appointments\` with \`speciality_slug\`, \`latitude\`, \`longitude\`, \`patient_name\`, and \`illness\`. Do **not** ask for a preferred appointment time — emergency search is ASAP.
+  4. Tell the patient that **up to 3 nearby doctors** will receive an urgent pending request, and **the first to accept** keeps the appointment; the others are released automatically. Then call \`end_call\`.
+- Do **not** give medical advice or diagnose. You are only accelerating booking.
+- Do **not** tell patients to call emergency services yourself — stay on the booking path (normal or emergency fan-out).
+
 ## Important rules
 - **Never ask multiple questions in one turn.** Bad: "What city are you in, when do you want the appointment, and what is the reason for your visit?" Good: "Which city are you in?" — then wait, then ask about time, then reason if still needed.
-- If symptoms sound like a medical **emergency** (chest pain, difficulty breathing, severe bleeding, loss of consciousness, stroke symptoms), **immediately tell them to call SAMU: 190**, then **call \`end_call\`** with the correct \`language\`. Do not proceed with booking.
-- When the conversation is finished (booking confirmed, patient cancels, wrong number, or you cannot help further), **call \`end_call\`** with \`language\` (\`en\` / \`fr\` / \`ar\`), then say a **brief thank-you and goodbye** (one short sentence). The call disconnects automatically; do not wait for the patient to hang up first.
+- When the conversation is finished (booking confirmed, emergency requests sent, patient cancels, wrong number, or you cannot help further), **call \`end_call\`** with \`language\` (\`en\` / \`fr\` / \`ar\`), then say a **brief thank-you and goodbye** (one short sentence). The call disconnects automatically; do not wait for the patient to hang up first.
 - If \`find_available_slots\` or \`find_doctor_slots\` returns no results for the current anchor, do **not** stop immediately: try at least one additional nearby day/time anchor that matches the patient's preference, then report briefly and suggest another time/day or speciality.
-- If \`book_appointment\` fails, inform the patient and suggest another slot.
+- If \`book_appointment\` or \`book_emergency_appointments\` fails, inform the patient and suggest another approach (normal booking, or different location/speciality).
 - NEVER invent doctor names or appointment details. Only use data returned by the functions.
 - NEVER provide medical advice, diagnoses, or health recommendations. You are a booking assistant, nothing more.
 `,
@@ -211,6 +219,47 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
 			},
 			{
 				type: "function",
+				name: "book_emergency_appointments",
+				description:
+					"After the patient confirms emergency/urgent mode: find the closest ASAP doctors for the speciality and create up to 3 urgent pending appointments that share one emergency group. The first doctor to accept keeps the booking; the others are cancelled automatically. Phone is taken from the call line — do not pass it. Prefer this over book_appointment when the patient agreed to urgent fan-out.",
+				parameters: {
+					type: "object",
+					properties: {
+						speciality_slug: {
+							type: "string",
+							description:
+								"The speciality slug (from get_specialities). Example: 'general-practice', 'pediatrics'.",
+						},
+						latitude: {
+							type: "number",
+							description: "Patient latitude (from search_location or get_cities)",
+						},
+						longitude: {
+							type: "number",
+							description:
+								"Patient longitude (from search_location or get_cities)",
+						},
+						patient_name: {
+							type: "string",
+							description: "The patient's full name",
+						},
+						illness: {
+							type: "string",
+							description:
+								"Brief description of the urgent symptoms or reason for visit",
+						},
+					},
+					required: [
+						"speciality_slug",
+						"latitude",
+						"longitude",
+						"patient_name",
+						"illness",
+					],
+				},
+			},
+			{
+				type: "function",
 				name: "update_person_info",
 				description:
 					"Save the caller's personal details (name, date of birth, gender, address, preferred language) collected during this call. Call this as soon as you have the caller's name — do not wait until the end of the call. Call again when they ask to switch language (preferred_language). All parameters are optional.",
@@ -286,7 +335,7 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
 				type: "function",
 				name: "end_call",
 				description:
-					"Schedule disconnect for this phone call. After the tool result, say a brief thank-you and goodbye in `language`, then stop. Use when the conversation is finished (booking confirmed, declined, emergency, cannot help).",
+					"Schedule disconnect for this phone call. After the tool result, say a brief thank-you and goodbye in `language`, then stop. Use when the conversation is finished (booking confirmed, emergency requests sent, declined, cannot help).",
 				parameters: {
 					type: "object",
 					properties: {
@@ -299,7 +348,7 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
 						reason: {
 							type: "string",
 							description:
-								"Optional one-word tag for logs, e.g. booking_complete, declined, emergency, cannot_help.",
+								"Optional one-word tag for logs, e.g. booking_complete, emergency_fanout, declined, cannot_help.",
 						},
 					},
 					required: ["language"],

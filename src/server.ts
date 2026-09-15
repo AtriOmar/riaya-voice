@@ -20,6 +20,7 @@ import { getSystemMessage } from "./sessions/systemMessages.js";
 import { TwilioSession } from "./sessions/twilioSession.js";
 import "./workers/reviewWorker.js"; // Start the review worker
 import "./workers/subscriptionWorker.js"; // Start the subscription cron worker
+import "./workers/pendingTimeoutWorker.js"; // Auto-cancel unanswered AI pending appointments
 
 const PORT = process.env.PORT || 8080;
 

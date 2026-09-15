@@ -3,12 +3,12 @@ import axios from "axios";
 import type { Logger } from "pino";
 import twilio from "twilio";
 import { type RawData, WebSocket } from "ws";
-import { createCallEvent, ensureCallRow, updateCall } from "../api/callsApi.js";
-import { nextjsApi } from "../api/nextjsApiClient.js";
 import {
 	cancelCallerAiAppointment,
 	listCallerAiAppointments,
 } from "../api/callerAppointmentsApi.js";
+import { createCallEvent, ensureCallRow, updateCall } from "../api/callsApi.js";
+import { nextjsApi } from "../api/nextjsApiClient.js";
 import { ensurePersonRow, updatePersonRow } from "../api/personsApi.js";
 import { CITIES } from "../constants/cities.js";
 import { SPECIALITIES } from "../constants/specialities.js";
@@ -187,6 +187,14 @@ type BookAppointmentToolArgs = {
 	end: string;
 };
 
+type BookEmergencyAppointmentsToolArgs = {
+	specialitySlug: string;
+	latitude: number;
+	longitude: number;
+	patientName: string;
+	illness: string;
+};
+
 function phoneDigitsOnly(raw: string): string {
 	return raw.replace(/\D/g, "");
 }
@@ -316,6 +324,29 @@ function normalizeBookAppointmentArgs(
 		start,
 		end,
 	};
+}
+
+function normalizeBookEmergencyAppointmentsArgs(
+	raw: unknown,
+): BookEmergencyAppointmentsToolArgs | null {
+	if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+		return null;
+	const o = raw as Record<string, unknown>;
+	const specialitySlug = strField(o, "speciality_slug", "specialitySlug");
+	const latitude = numField(o, "latitude", "latitude");
+	const longitude = numField(o, "longitude", "longitude");
+	const patientName = strField(o, "patient_name", "patientName");
+	const illness = strField(o, "illness", "illness");
+	if (
+		specialitySlug === undefined ||
+		latitude === undefined ||
+		longitude === undefined ||
+		patientName === undefined ||
+		illness === undefined
+	) {
+		return null;
+	}
+	return { specialitySlug, latitude, longitude, patientName, illness };
 }
 
 /** Accepts snake_case (tool schema) or legacy camelCase; maps to internal shape for HTTP. */
@@ -566,7 +597,7 @@ export class TwilioSession {
 		const profileBlock = knownName
 			? `Known first name: **${knownName}** (use in greeting; you may skip asking for name unless unclear).`
 			: "Name not on file yet — ask for their name early in the booking flow.";
-		let instructions = `${this.systemMessage.message}
+		const instructions = `${this.systemMessage.message}
 
 ## CALLER PROFILE
 ${profileBlock}
@@ -1345,6 +1376,20 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 					result = await this.bookAppointment(bookArgs);
 					break;
 				}
+				case "book_emergency_appointments": {
+					const emergencyArgs =
+						normalizeBookEmergencyAppointmentsArgs(parsedArgs);
+					if (!emergencyArgs) {
+						result = JSON.stringify({
+							error: true,
+							message:
+								"book_emergency_appointments: invalid arguments (expected speciality_slug, latitude, longitude, patient_name, illness)",
+						});
+						break;
+					}
+					result = await this.bookEmergencyAppointments(emergencyArgs);
+					break;
+				}
 				case "update_person_info": {
 					const personArgs = normalizeUpdatePersonInfoArgs(parsedArgs);
 					if (!personArgs) {
@@ -1638,6 +1683,12 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 			distanceKm: Math.round(doc.distance * 10) / 10,
 			slotStart: doc.nextSlot.start,
 			slotEnd: doc.nextSlot.end,
+			// Additional nearby slots so the AI can offer alternatives without
+			// a second find_available_slots call.
+			nearbySlots: (doc.nearbySlots ?? []).map((s) => ({
+				slotStart: s.start,
+				slotEnd: s.end,
+			})),
 		}));
 
 		console.log(
@@ -1744,8 +1795,7 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 			includeRecentPast: options?.includeRecentPast,
 		});
 		return JSON.stringify({
-			found:
-				data.upcoming.length > 0 || data.recentPast.length > 0,
+			found: data.upcoming.length > 0 || data.recentPast.length > 0,
 			upcoming: data.upcoming,
 			recentPast: data.recentPast,
 			message:
@@ -1913,6 +1963,123 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 			appointment_id: appointmentId,
 			status: row?.status,
 			message: "Appointment created successfully with pending status.",
+		});
+	}
+
+	private async bookEmergencyAppointments(
+		params: BookEmergencyAppointmentsToolArgs,
+	): Promise<string> {
+		console.log(
+			"---------------------- book_emergency_appointments INPUT ----------------------",
+		);
+		console.log(JSON.stringify(params, null, 2));
+		console.log("callerPhone:", this.callerPhone);
+		console.log(
+			"-------------------------------------------------------------",
+		);
+
+		const callerRaw = this.callerPhone?.trim();
+		if (!callerRaw) {
+			return JSON.stringify({
+				error: true,
+				message:
+					"book_emergency_appointments: no caller phone on this call (Twilio From / callerPhone)",
+			});
+		}
+
+		const phoneNumber = phoneDigitsOnly(callerRaw);
+		if (phoneNumber.length < 8) {
+			return JSON.stringify({
+				error: true,
+				message: `book_emergency_appointments: caller phone too short after normalization (${phoneNumber.length} digits)`,
+			});
+		}
+
+		const body = {
+			speciality: params.specialitySlug,
+			lat: params.latitude,
+			long: params.longitude,
+			name: params.patientName,
+			phoneNumber,
+			illness: params.illness,
+		};
+
+		const bookPath = "/api/appointments/external/emergency";
+		console.log(
+			"---------------------- book_emergency_appointments REQUEST ----------------------",
+		);
+		console.log("url:", `${nextjsApi.defaults.baseURL}${bookPath}`);
+		console.log("body:", JSON.stringify(body, null, 2));
+		console.log(
+			"-------------------------------------------------------------",
+		);
+
+		const { data } = await nextjsApi.post<{
+			found: boolean;
+			emergencyGroupId?: string;
+			appointments?: Array<{ id?: number; doctorId?: number }>;
+			doctors?: Array<{
+				doctorId: number;
+				name: string;
+				cabinet: string | null;
+				address: string | null;
+				distanceKm: number;
+				slotStart: string;
+				slotEnd: string;
+			}>;
+			message?: string;
+		}>(bookPath, body);
+
+		console.log(
+			"---------------------- book_emergency_appointments RESPONSE ----------------------",
+		);
+		console.log(data);
+		console.log(
+			"-------------------------------------------------------------",
+		);
+
+		if (!data.found || !data.appointments?.length) {
+			return JSON.stringify({
+				success: false,
+				found: false,
+				message:
+					data.message ??
+					"No nearby doctors available for an urgent booking right now.",
+			});
+		}
+
+		if (this.callSid) {
+			for (const appt of data.appointments) {
+				this.broadcastDashboard({
+					type: "appointment_booked",
+					callSid: this.callSid,
+					data: {
+						...appt,
+						urgent: true,
+						newPatientName: params.patientName,
+					},
+				});
+			}
+			this.persistEvent({
+				type: "appointment_booked",
+				content: `Urgent fan-out: ${data.appointments.length} pending appointment(s)`,
+				functionResult: data,
+			});
+			this.persistCallUpdate({
+				appointmentId: data.appointments[0]?.id ?? null,
+				callerName: params.patientName,
+			});
+		}
+
+		return JSON.stringify({
+			success: true,
+			found: true,
+			emergency_group_id: data.emergencyGroupId,
+			count: data.appointments.length,
+			doctors: data.doctors,
+			message:
+				data.message ??
+				"Urgent requests sent to nearby doctors. The first to accept keeps the appointment.",
 		});
 	}
 
