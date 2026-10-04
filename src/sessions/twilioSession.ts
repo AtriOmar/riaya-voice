@@ -1,4 +1,3 @@
-import { DefaultAzureCredential } from "@azure/identity";
 import axios from "axios";
 import type { Logger } from "pino";
 import twilio from "twilio";
@@ -12,6 +11,11 @@ import { nextjsApi } from "../api/nextjsApiClient.js";
 import { ensurePersonRow, updatePersonRow } from "../api/personsApi.js";
 import { CITIES } from "../constants/cities.js";
 import { SPECIALITIES } from "../constants/specialities.js";
+import {
+	createRealtimeProvider,
+	type RealtimeFunctionCall,
+	type RealtimeProvider,
+} from "../realtime/index.js";
 import type {
 	BestFitDoctor,
 	BookAppointmentParams,
@@ -20,14 +24,6 @@ import type {
 	SystemMessage,
 	TwilioMediaMessage,
 } from "../types/index.js";
-
-const {
-	BACKEND,
-	OPENAI_API_KEY,
-	OPENAI_ENDPOINT,
-	OPENAI_MODEL,
-	OPENAI_API_VERSION,
-} = process.env as Record<string, string>;
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
@@ -61,33 +57,6 @@ function findCityByName(raw: string) {
 		),
 	);
 }
-
-// ==================== Session Config ====================
-
-const SESSION_CONFIG = {
-	modalities: ["text", "audio"],
-	voice: "ash",
-	input_audio_format: "g711_ulaw",
-	output_audio_format: "g711_ulaw",
-	input_audio_transcription: {
-		model: process.env.INPUT_TRANSCRIPTION_MODEL?.trim() || "gpt-4o-transcribe",
-		prompt:
-			"The audio may be in Tunisian Arabic (Tunisian Derja), English, or French — transcribe in whatever language the caller uses; do not translate to another language. " +
-			"Context: patients calling Riaya, a healthcare platform in Tunisia, to book doctor appointments by phone. " +
-			"Expect symptoms and reasons for visit; medical speciality names; Tunisian city and neighborhood names; doctor and clinic (cabinet) names; " +
-			"dates and times patients mention (often Tunisia local time, GMT+1); booking and confirmation phrases; phone numbers and people's names.",
-	},
-	turn_detection: {
-		type: "server_vad",
-		threshold: parseFloat(process.env.VAD_THRESHOLD || "0.5"),
-		silence_duration_ms: parseInt(process.env.SILENCE_DURATION_MS || "600", 10),
-	},
-	tool_choice: "auto",
-	max_response_output_tokens: parseInt(
-		process.env.MAX_OUTPUT_TOKENS || "4096",
-		10,
-	),
-};
 
 type CallLanguage = "en" | "fr" | "ar";
 
@@ -437,39 +406,13 @@ function normalizeCancelAppointmentArgs(
 	return { appointmentId };
 }
 
-// ==================== OpenAI Realtime Event Types ====================
-
-const EVENTS = {
-	SessionCreated: "session.created",
-	SessionUpdated: "session.updated",
-	InputAudioBufferSpeechStarted: "input_audio_buffer.speech_started",
-	InputAudioBufferSpeechStopped: "input_audio_buffer.speech_stopped",
-	InputAudioBufferCommitted: "input_audio_buffer.committed",
-	ResponseAudioDelta: "response.audio.delta",
-	ResponseAudioDone: "response.audio.done",
-	ResponseAudioTranscriptDelta: "response.audio_transcript.delta",
-	ResponseAudioTranscriptDone: "response.audio_transcript.done",
-	ResponseFunctionCallArgumentsDone: "response.function_call_arguments.done",
-	ResponseDone: "response.done",
-	Error: "error",
-	ConversationItemCreated: "conversation.item.created",
-	ConversationItemInputAudioTranscriptionCompleted:
-		"conversation.item.input_audio_transcription.completed",
-	ConversationItemInputAudioTranscriptionFailed:
-		"conversation.item.input_audio_transcription.failed",
-	RateLimitsUpdated: "rate_limits.updated",
-	ResponseOutputItemDone: "response.output_item.done",
-};
-
 // ==================== TwilioSession ====================
 
 export class TwilioSession {
-	// Azure auth token cache (shared across sessions)
-	private static tokenCache: { token: string; expires: number } | null = null;
-	private static readonly TOKEN_REFRESH_THRESHOLD_MS = 5 * 60 * 1000;
-
 	// Connection state
-	private openAIWs!: WebSocket;
+	private readonly provider: RealtimeProvider;
+	/** Provider connection is open and can accept `start()`. */
+	private providerReady = false;
 	private streamSid: string | null = null;
 	private callSid: string | null = null;
 
@@ -488,7 +431,7 @@ export class TwilioSession {
 	/** DB id of the person record for this caller (set once callerPhone is known). */
 	private personId: number | null = null;
 
-	/** Only the first session.update should trigger the opening greeting */
+	/** Session has been started (config + opening greeting sent) */
 	private initialGreetingSent = false;
 	/** Twilio media `start` received — callerPhone / person lookup may still be in flight. */
 	private twilioStreamStarted = false;
@@ -506,8 +449,12 @@ export class TwilioSession {
 	private hangupScheduled = false;
 	/** `end_call` was invoked; hang up after the assistant goodbye response finishes. */
 	private pendingHangup = false;
-	/** Ignore the next `response.done` (the turn that invoked `end_call`); hang up after the following one. */
-	private skipNextResponseDoneForEndCall = false;
+	/**
+	 * AI audio arrived after the `end_call` result was sent, i.e. the goodbye is
+	 * being spoken. The response that merely invoked `end_call` (no audio after
+	 * the result) must not trigger the hangup.
+	 */
+	private goodbyeAudioStarted = false;
 	/** Goodbye audio has finished generating; hang up once Twilio marks drain. */
 	private hangupAfterPlayback = false;
 	private hangupTimer: ReturnType<typeof setTimeout> | null = null;
@@ -528,6 +475,26 @@ export class TwilioSession {
 		private readonly dashboardClients: Set<WebSocket>,
 	) {
 		this.logger.info("🟢 TwilioSession created");
+		this.provider = createRealtimeProvider(this.logger, {
+			onReady: () => {
+				this.providerReady = true;
+				this.trySendInitialGreeting();
+			},
+			onAudio: (payload, itemId) => this.handleAudioDelta(payload, itemId),
+			onAiTranscriptDelta: (delta) => this.handleAiTranscriptDelta(delta),
+			onAiTranscriptDone: (text) => this.handleAiTranscriptDone(text),
+			onPatientTranscript: (text) => this.handlePatientTranscript(text),
+			onSpeechStarted: () => this.handleSpeechStarted(),
+			onFunctionCall: (call) => {
+				void this.handleFunctionCall(call);
+			},
+			onResponseDone: () => {
+				this.logger.debug("✅ Response complete");
+				this.onResponseDone();
+			},
+			onError: (message, detail) => this.handleProviderError(message, detail),
+			onClose: () => this.dispose(),
+		});
 		this.initialize().catch((error) =>
 			this.logger.error({ error }, "🔥 Failed to initialize TwilioSession"),
 		);
@@ -539,70 +506,8 @@ export class TwilioSession {
 		// Set up Twilio handlers FIRST so we don't miss early events (start, connected)
 		// that Twilio sends immediately after the WebSocket is established
 		this.setupTwilioHandlers();
-		this.openAIWs = await this.connectToOpenAI();
-		this.setupOpenAIHandlers();
-	}
-
-	private connectToOpenAI(): Promise<WebSocket> {
-		const url =
-			BACKEND === "azure"
-				? `${OPENAI_ENDPOINT.replace("https://", "wss://")}/openai/realtime?deployment=${OPENAI_MODEL}&api-version=${OPENAI_API_VERSION}`
-				: `wss://api.openai.com/v1/realtime?model=${OPENAI_MODEL || "gpt-4o-realtime-preview"}`;
-
-		this.logger.info(`🔌 Connecting to OpenAI at ${url}`);
-
-		// biome-ignore lint/suspicious/noAsyncPromiseExecutor: I found the code already like this and it seems to be working fine --- IGNORE ---
-		return new Promise(async (resolve, reject) => {
-			const headers = await this.getHeaders();
-			const ws = new WebSocket(url, { headers });
-
-			ws.on("open", () => {
-				this.logger.info("🟢 OpenAI WebSocket connected");
-				resolve(ws);
-			});
-
-			ws.on("error", (error) => {
-				this.logger.error({ error }, "🔥 OpenAI WebSocket connection error");
-				reject(error);
-			});
-		});
-	}
-
-	private async getHeaders(): Promise<Record<string, string>> {
-		if (BACKEND === "azure") {
-			if (OPENAI_API_KEY) {
-				this.logger.info("✅ Using Azure API key");
-				return { "api-key": OPENAI_API_KEY };
-			}
-
-			// Managed identity fallback
-			const now = Date.now();
-			if (
-				TwilioSession.tokenCache &&
-				TwilioSession.tokenCache.expires >
-					now + TwilioSession.TOKEN_REFRESH_THRESHOLD_MS
-			) {
-				return { Authorization: `Bearer ${TwilioSession.tokenCache.token}` };
-			}
-
-			const token = await new DefaultAzureCredential().getToken(
-				"https://cognitiveservices.azure.com/.default",
-			);
-			if (!token?.token)
-				throw new Error("Failed to retrieve Azure access token");
-
-			TwilioSession.tokenCache = {
-				token: token.token,
-				expires: token.expiresOnTimestamp,
-			};
-			return { Authorization: `Bearer ${token.token}` };
-		}
-
-		if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not set");
-		return {
-			Authorization: `Bearer ${OPENAI_API_KEY}`,
-			"OpenAI-Beta": "realtime=v1",
-		};
+		this.logger.info(`🔌 Realtime provider: ${this.provider.name}`);
+		await this.provider.connect();
 	}
 
 	private buildSessionInstructions(): string {
@@ -661,178 +566,89 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 
 	private trySendInitialGreeting() {
 		if (this.initialGreetingSent) return;
-		if (this.openAIWs?.readyState !== WebSocket.OPEN) return;
-		// OpenAI often reaches SessionUpdated before Twilio `start`; wait so we can load name/lang.
+		if (!this.providerReady) return;
+		// The provider is often ready before Twilio `start`; wait so we can load name/lang.
 		if (!this.twilioStreamStarted) return;
 		if (!this.personProfileResolved) return;
 
 		this.initialGreetingSent = true;
-		this.sendInitialGreeting();
+		this.provider.start(
+			{
+				instructions: this.buildSessionInstructions(),
+				tools: this.systemMessage.tools,
+				language: this.callerPreferredLanguage,
+			},
+			buildInitialGreetingInstructions(
+				this.callerPreferredLanguage,
+				this.callerFirstName,
+			),
+		);
+		this.logger.info(
+			{
+				language: this.callerPreferredLanguage,
+				hasCallerPhone: Boolean(this.callerPhone),
+			},
+			"🗣️ Session started, initial greeting triggered",
+		);
 	}
 
+	/** Refresh instructions after the session started (profile / language changed). */
 	private sendSessionConfig() {
-		if (this.openAIWs?.readyState !== WebSocket.OPEN) return;
-
-		this.openAIWs.send(
-			JSON.stringify({
-				type: "session.update",
-				session: {
-					instructions: this.buildSessionInstructions(),
-					tools: this.systemMessage.tools,
-					...SESSION_CONFIG,
-				},
-			}),
-		);
-		this.logger.info(
-			{ hasCallerPhone: Boolean(this.callerPhone) },
-			"✅ Session config sent to OpenAI",
-		);
-	}
-
-	private sendInitialGreeting() {
-		if (this.openAIWs?.readyState !== WebSocket.OPEN) return;
-
-		const instructions = buildInitialGreetingInstructions(
-			this.callerPreferredLanguage,
-			this.callerFirstName,
-		);
-		this.openAIWs.send(
-			JSON.stringify({
-				type: "response.create",
-				response: {
-					modalities: ["text", "audio"],
-					instructions,
-				},
-			}),
-		);
-		this.logger.info(
-			{ language: this.callerPreferredLanguage },
-			"🗣️ Initial greeting triggered",
-		);
-	}
-
-	// ==================== OpenAI Event Handlers ====================
-
-	private setupOpenAIHandlers() {
-		this.openAIWs.on("message", (data: RawData) =>
-			this.handleOpenAIMessage(data),
-		);
-		this.openAIWs.on("close", () => {
-			this.logger.info("🔴 OpenAI WebSocket closed");
-			this.dispose();
+		if (!this.initialGreetingSent) return;
+		this.provider.updateSession({
+			instructions: this.buildSessionInstructions(),
+			tools: this.systemMessage.tools,
+			language: this.callerPreferredLanguage,
 		});
-		this.openAIWs.on("error", (error) =>
-			this.logger.error({ error }, "🔥 OpenAI WebSocket error"),
-		);
 	}
 
-	private handleOpenAIMessage(data: RawData) {
-		try {
-			const event = JSON.parse(data.toString());
-			console.log("-------------------- event --------------------");
-			console.log(event);
+	// ==================== Realtime Provider Event Handlers ====================
 
-			// biome-ignore lint/suspicious/noExplicitAny: screw this
-			const handlers: Record<string, (e: any) => void> = {
-				[EVENTS.SessionCreated]: () => {
-					this.logger.info("✅ OpenAI session created");
-					this.sendSessionConfig();
-				},
+	private handleAiTranscriptDelta(delta: string) {
+		if (!this.callSid) return;
+		this.currentAiTranscript += delta;
+		this.broadcastDashboard({
+			type: "ai_transcript",
+			callSid: this.callSid,
+			text: this.currentAiTranscript,
+			delta,
+			isFinal: false,
+		});
+	}
 
-				[EVENTS.SessionUpdated]: () => {
-					this.logger.info("✅ Session config updated");
-					this.trySendInitialGreeting();
-				},
-
-				[EVENTS.ResponseAudioDelta]: (e) => this.handleAudioDelta(e),
-
-				[EVENTS.ResponseAudioTranscriptDelta]: (e) => {
-					if (e.delta && this.callSid) {
-						this.currentAiTranscript += e.delta;
-						this.broadcastDashboard({
-							type: "ai_transcript",
-							callSid: this.callSid,
-							text: this.currentAiTranscript,
-							delta: e.delta,
-							isFinal: false,
-						});
-					}
-				},
-
-				[EVENTS.ResponseAudioTranscriptDone]: (e) => {
-					if (this.callSid) {
-						const finalText = e.transcript || this.currentAiTranscript;
-						this.broadcastDashboard({
-							type: "ai_transcript",
-							callSid: this.callSid,
-							text: finalText,
-							delta: "",
-							isFinal: true,
-						});
-						if (finalText) {
-							this.persistEvent({
-								type: "ai_transcript",
-								content: finalText,
-							});
-						}
-						this.currentAiTranscript = "";
-					}
-				},
-
-				[EVENTS.InputAudioBufferSpeechStarted]: () =>
-					this.handleSpeechStarted(),
-
-				[EVENTS.ConversationItemInputAudioTranscriptionCompleted]: (e) => {
-					if (e.transcript && this.callSid) {
-						this.logger.info({ transcript: e.transcript }, "📝 Patient said");
-						this.broadcastDashboard({
-							type: "patient_transcript",
-							callSid: this.callSid,
-							text: e.transcript,
-							isFinal: true,
-						});
-						this.persistEvent({
-							type: "patient_transcript",
-							content: e.transcript,
-						});
-					}
-				},
-
-				[EVENTS.ConversationItemInputAudioTranscriptionFailed]: (e) =>
-					this.logger.error({ error: e.error }, "🔥 Transcription failed"),
-
-				[EVENTS.ResponseFunctionCallArgumentsDone]: (e) =>
-					this.handleFunctionCall(e),
-
-				[EVENTS.ResponseDone]: () => {
-					this.logger.debug("✅ Response complete");
-					this.onResponseDone();
-				},
-
-				[EVENTS.Error]: (e) => {
-					this.logger.error({ error: e.error }, "🔥 OpenAI error");
-					if (this.callSid) {
-						const message = e.error?.message || "OpenAI error";
-						this.broadcastDashboard({
-							type: "error",
-							callSid: this.callSid,
-							message,
-						});
-						this.persistEvent({ type: "error", content: message });
-					}
-				},
-
-				[EVENTS.RateLimitsUpdated]: (e) =>
-					this.logger.info({ rateLimits: e.rate_limits }, "📊 Rate limits"),
-			};
-
-			const handler = handlers[event.type];
-			if (handler) {
-				handler(event);
-			}
-		} catch (error) {
-			this.logger.error({ error }, "🔥 Error processing OpenAI message");
+	private handleAiTranscriptDone(transcript: string) {
+		if (!this.callSid) return;
+		const finalText = transcript || this.currentAiTranscript;
+		this.broadcastDashboard({
+			type: "ai_transcript",
+			callSid: this.callSid,
+			text: finalText,
+			delta: "",
+			isFinal: true,
+		});
+		if (finalText) {
+			this.persistEvent({ type: "ai_transcript", content: finalText });
 		}
+		this.currentAiTranscript = "";
+	}
+
+	private handlePatientTranscript(transcript: string) {
+		if (!this.callSid) return;
+		this.logger.info({ transcript }, "📝 Patient said");
+		this.broadcastDashboard({
+			type: "patient_transcript",
+			callSid: this.callSid,
+			text: transcript,
+			isFinal: true,
+		});
+		this.persistEvent({ type: "patient_transcript", content: transcript });
+	}
+
+	private handleProviderError(message: string, detail?: unknown) {
+		this.logger.error({ error: detail, message }, "🔥 Realtime provider error");
+		if (!this.callSid) return;
+		this.broadcastDashboard({ type: "error", callSid: this.callSid, message });
+		this.persistEvent({ type: "error", content: message });
 	}
 
 	// ==================== Twilio Event Handlers ====================
@@ -942,25 +758,15 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 						timestamp: this.callStartedAt.toISOString(),
 					});
 
-					// Caller may arrive after OpenAI is connected; refresh instructions without re-greeting
-					if (this.openAIWs?.readyState === WebSocket.OPEN) {
-						this.sendSessionConfig();
-					}
+					this.trySendInitialGreeting();
 					break;
 				}
 
 				case "media":
 					this.latestMediaTimestamp = parseInt(msg.media.timestamp, 10);
 
-					// Forward audio to OpenAI
-					if (this.openAIWs?.readyState === WebSocket.OPEN) {
-						this.openAIWs.send(
-							JSON.stringify({
-								type: "input_audio_buffer.append",
-								audio: msg.media.payload,
-							}),
-						);
-					}
+					// Forward audio to the realtime model
+					this.provider.sendAudio(msg.media.payload);
 
 					// Forward audio to dashboard clients listening to this call
 					if (this.callSid) {
@@ -993,9 +799,9 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 
 	// ==================== Audio Handling ====================
 
-	// biome-ignore lint/suspicious/noExplicitAny: ignore
-	private handleAudioDelta(event: any) {
-		if (!event.delta || !this.streamSid) return;
+	private handleAudioDelta(payload: string, itemId?: string) {
+		if (!payload || !this.streamSid) return;
+		if (this.pendingHangup) this.goodbyeAudioStarted = true;
 
 		// Send audio back to Twilio
 		this.twilioWs.send(
@@ -1003,7 +809,7 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 				event: "media",
 				streamSid: this.streamSid,
 				media: {
-					payload: Buffer.from(event.delta, "base64").toString("base64"),
+					payload,
 				},
 			}),
 		);
@@ -1012,8 +818,8 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 			this.responseStartTimestampTwilio = this.latestMediaTimestamp;
 		}
 
-		if (event.item_id) {
-			this.lastAssistantItem = event.item_id;
+		if (itemId) {
+			this.lastAssistantItem = itemId;
 		}
 
 		// Send mark to track playback progress
@@ -1024,7 +830,7 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 			this.broadcastDashboard({
 				type: "ai_audio",
 				callSid: this.callSid,
-				payload: event.delta,
+				payload,
 			});
 		}
 	}
@@ -1051,16 +857,9 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 			const elapsedTime =
 				this.latestMediaTimestamp - this.responseStartTimestampTwilio;
 
-			// Tell OpenAI to truncate the current response
+			// Tell the model how much of the reply the caller actually heard
 			if (this.lastAssistantItem) {
-				this.openAIWs.send(
-					JSON.stringify({
-						type: "conversation.item.truncate",
-						item_id: this.lastAssistantItem,
-						content_index: 0,
-						audio_end_ms: elapsedTime,
-					}),
-				);
+				this.provider.truncate(this.lastAssistantItem, elapsedTime);
 			}
 
 			// Tell Twilio to clear its audio buffer
@@ -1080,53 +879,16 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 
 	// ==================== Function Calling ====================
 
-	private sendFunctionCallOutput(
-		call_id: string,
-		output: string,
-		options?: { continueConversation?: boolean },
-	) {
-		this.openAIWs.send(
-			JSON.stringify({
-				type: "conversation.item.create",
-				item: {
-					type: "function_call_output",
-					call_id,
-					output,
-				},
-			}),
-		);
-		if (options?.continueConversation === false) return;
-		this.openAIWs.send(JSON.stringify({ type: "response.create" }));
+	private sendFunctionCallOutput(call: RealtimeFunctionCall, output: string) {
+		this.provider.sendFunctionResult(call, output);
 	}
 
 	private onResponseDone() {
-		if (this.skipNextResponseDoneForEndCall) {
-			this.skipNextResponseDoneForEndCall = false;
-			return;
-		}
-		if (this.pendingHangup) {
+		// Hang up only after the goodbye turn, not the turn that called `end_call`.
+		if (this.pendingHangup && this.goodbyeAudioStarted) {
 			this.hangupAfterPlayback = true;
 			this.tryScheduleHangupAfterPlayback();
 		}
-	}
-
-	private disableTurnDetectionForClosing() {
-		if (this.openAIWs?.readyState !== WebSocket.OPEN) return;
-		this.openAIWs.send(
-			JSON.stringify({
-				type: "session.update",
-				session: {
-					turn_detection: {
-						type: "server_vad",
-						threshold: SESSION_CONFIG.turn_detection.threshold,
-						silence_duration_ms:
-							SESSION_CONFIG.turn_detection.silence_duration_ms,
-						interrupt_response: false,
-						create_response: false,
-					},
-				},
-			}),
-		);
 	}
 
 	private tryScheduleHangupAfterPlayback() {
@@ -1211,12 +973,8 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 			});
 	}
 
-	private async handleFunctionCall(event: {
-		call_id: string;
-		name?: string;
-		arguments: string;
-	}) {
-		const { call_id, name, arguments: args } = event;
+	private async handleFunctionCall(call: RealtimeFunctionCall) {
+		const { callId: call_id, name, args } = call;
 
 		if (!name) {
 			console.log(
@@ -1270,7 +1028,7 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 				});
 			}
 			this.sendFunctionCallOutput(
-				call_id,
+				call,
 				JSON.stringify({
 					error: true,
 					message: `${name}: invalid JSON arguments`,
@@ -1509,16 +1267,15 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 				});
 			}
 
-			this.sendFunctionCallOutput(call_id, result, {
-				continueConversation: true,
-			});
-
 			if (scheduleHangupAfterOutput) {
+				// Set before sending the result so the goodbye audio is recognised.
 				this.pendingHangup = true;
-				this.skipNextResponseDoneForEndCall = true;
-				this.disableTurnDetectionForClosing();
+				this.goodbyeAudioStarted = false;
+				this.provider.enterClosingMode();
 				this.scheduleFallbackHangup();
 			}
+
+			this.sendFunctionCallOutput(call, result);
 		} catch (error: unknown) {
 			consoleLogToolHttpError(
 				name,
@@ -1558,7 +1315,7 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 			}
 
 			this.sendFunctionCallOutput(
-				call_id,
+				call,
 				JSON.stringify({
 					error: true,
 					message: reason,
@@ -2240,15 +1997,7 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 		this.logger.info("🗑️ Disposing TwilioSession");
 		this.clearHangupTimers();
 
-		if (this.openAIWs) {
-			this.openAIWs.removeAllListeners();
-			if (
-				this.openAIWs.readyState !== WebSocket.CLOSED &&
-				this.openAIWs.readyState !== WebSocket.CLOSING
-			) {
-				this.openAIWs.close();
-			}
-		}
+		this.provider.close();
 
 		if (this.twilioWs) {
 			this.twilioWs.removeAllListeners();

@@ -3,7 +3,7 @@
 	"version": "1.0.0",
 	"main": "dist/server.js",
 	"license": "ISC",
-	"description": "Riaya Realtime - Twilio phone call to Azure OpenAI Realtime API bridge for doctor appointment booking",
+	"description": "Riaya Realtime - Twilio phone call to Gemini Live / OpenAI Realtime bridge for doctor appointment booking",
 	"type": "module",
 	"nodemonConfig": {
 		"ignore": [
@@ -21,7 +21,6 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
-		"@azure/identity": "^4.11.1",
 		"@biomejs/biome": "^2.4.10",
 		"@hapi/boom": "^10.0.1",
 		"@whiskeysockets/baileys": "7.0.0-rc13",
