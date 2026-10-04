@@ -42,6 +42,26 @@ function getTwilioRestClient(): ReturnType<typeof twilio> | null {
 	return twilioRestClient;
 }
 
+const CITY_SEARCH_RADIUS_M = 30_000;
+
+function normalizeCityName(raw: string): string {
+	return raw
+		.normalize("NFD")
+		.replace(/[\u0300-\u036f]/g, "")
+		.toLowerCase()
+		.trim();
+}
+
+function findCityByName(raw: string) {
+	const needle = normalizeCityName(raw);
+	if (!needle) return undefined;
+	return CITIES.find((c) =>
+		[c.slug, c.en_name, c.fr_name, c.ar_name].some(
+			(n) => normalizeCityName(n) === needle,
+		),
+	);
+}
+
 // ==================== Session Config ====================
 
 const SESSION_CONFIG = {
@@ -1583,17 +1603,39 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 			});
 		}
 		try {
-			const { data } = await axios.get(
-				"https://api.geoapify.com/v1/geocode/search",
-				{
-					params: {
-						text: `${query}, ${city}`,
-						filter: "countrycode:tn",
-						limit: 5,
-						apiKey: GEOAPIFY_API_KEY,
-					},
-				},
-			);
+			const cityMatch = findCityByName(city);
+			const baseParams = {
+				text: `${query}, ${city}`,
+				limit: 5,
+				apiKey: GEOAPIFY_API_KEY,
+			};
+			const search = async (filter: string, bias?: string) =>
+				(
+					await axios.get("https://api.geoapify.com/v1/geocode/search", {
+						params: { ...baseParams, filter, ...(bias ? { bias } : {}) },
+					})
+				).data;
+
+			let data: { features?: unknown[] };
+			if (cityMatch) {
+				const { longitude, latitude } = cityMatch;
+				data = await search(
+					`circle:${longitude},${latitude},${CITY_SEARCH_RADIUS_M}`,
+					`proximity:${longitude},${latitude}`,
+				);
+				if (!data.features?.length) {
+					this.logger.info(
+						{ city: cityMatch.slug },
+						"Geocoding: no results inside city radius, retrying country-wide",
+					);
+					data = await search(
+						"countrycode:tn",
+						`proximity:${longitude},${latitude}`,
+					);
+				}
+			} else {
+				data = await search("countrycode:tn");
+			}
 			const features = data.features || [];
 			if (features.length === 0) {
 				return JSON.stringify({
