@@ -35,6 +35,8 @@ export type RealtimeSessionConfig = {
 	tools: SystemMessageTool[];
 	/** Caller's current language — lets providers pick a matching voice/locale. */
 	language?: "en" | "fr" | "ar";
+	/** Caller's known first name — for providers that can't rewrite instructions mid-call. */
+	firstName?: string | null;
 };
 
 export interface RealtimeProvider {

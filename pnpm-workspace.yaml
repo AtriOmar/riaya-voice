@@ -1,6 +1,8 @@
 allowBuilds:
+  '@livekit/local-inference': true
   '@whiskeysockets/baileys': true
   esbuild: true
   msgpackr-extract: true
+  onnxruntime-node: true
   protobufjs: true
   sharp: true

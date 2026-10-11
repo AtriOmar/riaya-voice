@@ -52,7 +52,10 @@ async function tryOutboundCall(params: {
 			from: TWILIO_PHONE_NUMBER,
 			twiml,
 		});
-		logger.info({ phone: params.phone }, "[PendingTimeout] Outbound call placed");
+		logger.info(
+			{ phone: params.phone },
+			"[PendingTimeout] Outbound call placed",
+		);
 		return true;
 	} catch (err) {
 		logger.error({ err }, "[PendingTimeout] Outbound call failed");
@@ -145,8 +148,5 @@ export const pendingTimeoutWorker = new Worker(
 );
 
 pendingTimeoutWorker.on("failed", (job, err) => {
-	logger.error(
-		{ jobId: job?.id, err },
-		"[PendingTimeout] Job failed event",
-	);
+	logger.error({ jobId: job?.id, err }, "[PendingTimeout] Job failed event");
 });

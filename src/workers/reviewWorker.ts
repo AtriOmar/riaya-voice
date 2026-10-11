@@ -36,13 +36,7 @@ export const reviewWorker = new Worker(
 				},
 			);
 
-			const {
-				success,
-				reason,
-				phone,
-				adminId,
-				message,
-			} = response.data;
+			const { success, reason, phone, adminId, message } = response.data;
 
 			if (!success) {
 				logger.info({ reason }, "[ReviewWorker] Job skipped");

@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import { config } from "dotenv";
 
@@ -32,6 +33,14 @@ const logger = pino({
 const app = express();
 const server = http.createServer(app);
 
+/** Constant-time check of the `x-internal-secret` header against INTERNAL_API_SECRET. */
+function hasInternalSecret(header: string | string[] | undefined): boolean {
+	const expected = process.env.INTERNAL_API_SECRET ?? "";
+	const given = typeof header === "string" ? header : "";
+	if (!expected || given.length !== expected.length) return false;
+	return timingSafeEqual(Buffer.from(given), Buffer.from(expected));
+}
+
 /** Escape for use inside TwiML double-quoted attribute values */
 function escapeXmlAttr(value: string): string {
 	return value
@@ -41,10 +50,12 @@ function escapeXmlAttr(value: string): string {
 		.replace(/"/g, "&quot;");
 }
 
-// Three WebSocket servers: Twilio media streams, dashboard monitoring, WhatsApp admin
+// WebSocket servers: Twilio media streams, dashboard monitoring, WhatsApp admin,
+// and dashboard events relayed from the LiveKit agent process
 const twilioWss = new WebSocketServer({ noServer: true });
 const dashboardWss = new WebSocketServer({ noServer: true });
 const whatsappWss = new WebSocketServer({ noServer: true });
+const agentEventsWss = new WebSocketServer({ noServer: true });
 
 // Store for dashboard monitoring connections
 const dashboardClients = new Set<WebSocket>();
@@ -149,7 +160,7 @@ app.post("/send-whatsapp", async (req: Request, res: Response) => {
 				mimetype,
 			);
 		} else {
-			await service.sendMessage(phone, message!);
+			await service.sendMessage(phone, message ?? "");
 		}
 		res.json({ ok: true });
 	} catch (err) {
@@ -207,16 +218,47 @@ app.all("/incoming-call", (req: Request, res: Response) => {
 		);
 	}
 
-	const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+	// CALL_ROUTER=livekit hands the call to the LiveKit agent over SIP;
+	// anything else keeps the media-stream session (Gemini Live etc.).
+	const useLivekit =
+		process.env.CALL_ROUTER?.trim().toLowerCase() === "livekit";
+	const twiml = useLivekit
+		? livekitDialTwiml({ to, callSid })
+		: `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="wss://${host}/media-stream">${callerParameter}
     </Stream>
   </Connect>
 </Response>`;
+	logger.info(
+		{ router: useLivekit ? "livekit" : "media-stream" },
+		"📞 Call router",
+	);
 
 	res.type("text/xml").send(twiml);
 });
+
+/**
+ * TwiML that bridges the call to LiveKit SIP. The CallSid travels as a custom
+ * SIP header so the agent can reuse the call row created above (the LiveKit
+ * inbound trunk maps `X-Twilio-CallSid` to the `twilio.callSid` attribute).
+ */
+function livekitDialTwiml({ to, callSid }: { to: string; callSid: string }) {
+	const sipHost = process.env.LIVEKIT_SIP_HOST?.trim() ?? "";
+	const username = process.env.LIVEKIT_SIP_USERNAME?.trim() ?? "";
+	const password = process.env.LIVEKIT_SIP_PASSWORD?.trim() ?? "";
+	const header = callSid
+		? `?X-Twilio-CallSid=${encodeURIComponent(callSid)}`
+		: "";
+	const uri = `sip:${to}@${sipHost};transport=tcp${header}`;
+	return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial>
+    <Sip username="${escapeXmlAttr(username)}" password="${escapeXmlAttr(password)}">${escapeXmlAttr(uri)}</Sip>
+  </Dial>
+</Response>`;
+}
 
 // ==================== WebSocket Upgrade ====================
 
@@ -240,6 +282,15 @@ server.on("upgrade", (request, socket, head) => {
 		whatsappWss.handleUpgrade(request, socket, head, (ws) => {
 			whatsappWss.emit("connection", ws, request);
 		});
+	} else if (pathname === "/agent-events") {
+		if (!hasInternalSecret(request.headers["x-internal-secret"])) {
+			socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+			socket.destroy();
+			return;
+		}
+		agentEventsWss.handleUpgrade(request, socket, head, (ws) => {
+			agentEventsWss.emit("connection", ws, request);
+		});
 	} else {
 		socket.destroy();
 	}
@@ -259,6 +310,23 @@ twilioWss.on("connection", (ws: WebSocket) => {
 
 	// Each Twilio call gets its own session that bridges Twilio ↔ OpenAI ↔ Dashboard
 	new TwilioSession(ws, logger, systemMessage, dashboardClients);
+});
+
+// ==================== LiveKit Agent Event Relay ====================
+// The LiveKit agent runs in its own process; it sends DashboardMessage JSON here
+// and we fan it out to dashboard clients exactly like TwilioSession does.
+
+agentEventsWss.on("connection", (ws: WebSocket) => {
+	logger.info("🤖 LiveKit agent relay connected");
+	ws.on("message", (data) => {
+		const json = data.toString();
+		for (const client of dashboardClients) {
+			if (client.readyState === client.OPEN) client.send(json);
+		}
+	});
+	ws.on("error", (error) =>
+		logger.error({ error }, "🔥 Agent relay WebSocket error"),
+	);
 });
 
 // ==================== Dashboard Monitoring Connections ====================
