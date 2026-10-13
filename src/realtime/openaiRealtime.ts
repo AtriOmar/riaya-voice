@@ -9,39 +9,46 @@ import type {
 
 const { OPENAI_API_KEY, OPENAI_MODEL } = process.env as Record<string, string>;
 
-const SESSION_CONFIG = {
-	modalities: ["text", "audio"],
-	voice: "ash",
-	input_audio_format: "g711_ulaw",
-	output_audio_format: "g711_ulaw",
-	input_audio_transcription: {
-		model: process.env.INPUT_TRANSCRIPTION_MODEL?.trim() || "gpt-4o-transcribe",
-		prompt:
-			"The audio may be in Tunisian Arabic (Tunisian Derja), English, or French — transcribe in whatever language the caller uses; do not translate to another language. " +
-			"Context: patients calling Riaya, a healthcare platform in Tunisia, to book doctor appointments by phone. " +
-			"Expect symptoms and reasons for visit; medical speciality names; Tunisian city and neighborhood names; doctor and clinic (cabinet) names; " +
-			"dates and times patients mention (often Tunisia local time, GMT+1); booking and confirmation phrases; phone numbers and people's names.",
-	},
-	turn_detection: {
+const AUDIO_FORMAT = { type: "audio/pcmu" } as const;
+const VOICE = "ash";
+const TRANSCRIPTION_PROMPT =
+	"The audio may be in Tunisian Arabic (Tunisian Derja), English, or French — transcribe in whatever language the caller uses; do not translate to another language. " +
+	"Context: patients calling Riaya, a healthcare platform in Tunisia, to book doctor appointments by phone. " +
+	"Expect symptoms and reasons for visit; medical speciality names; Tunisian city and neighborhood names; doctor and clinic (cabinet) names; " +
+	"dates and times patients mention (often Tunisia local time, GMT+1); booking and confirmation phrases; phone numbers and people's names.";
+
+function turnDetection(extra: Record<string, unknown> = {}) {
+	return {
 		type: "server_vad",
 		threshold: parseFloat(process.env.VAD_THRESHOLD || "0.5"),
 		silence_duration_ms: parseInt(process.env.SILENCE_DURATION_MS || "600", 10),
-	},
-	tool_choice: "auto",
-	max_response_output_tokens: parseInt(
-		process.env.MAX_OUTPUT_TOKENS || "4096",
-		10,
-	),
-};
+		...extra,
+	};
+}
+
+function sessionAudio(turn: Record<string, unknown>) {
+	return {
+		input: {
+			format: AUDIO_FORMAT,
+			transcription: {
+				model:
+					process.env.INPUT_TRANSCRIPTION_MODEL?.trim() || "gpt-4o-transcribe",
+				prompt: TRANSCRIPTION_PROMPT,
+			},
+			turn_detection: turn,
+		},
+		output: { format: AUDIO_FORMAT, voice: VOICE },
+	};
+}
 
 const EVENTS = {
 	SessionCreated: "session.created",
 	SessionUpdated: "session.updated",
 	InputAudioBufferSpeechStarted: "input_audio_buffer.speech_started",
-	ResponseAudioDelta: "response.audio.delta",
-	ResponseAudioTranscriptDelta: "response.audio_transcript.delta",
-	ResponseAudioTranscriptDone: "response.audio_transcript.done",
-	ResponseFunctionCallArgumentsDone: "response.function_call_arguments.done",
+	ResponseOutputAudioDelta: "response.output_audio.delta",
+	ResponseOutputAudioTranscriptDelta: "response.output_audio_transcript.delta",
+	ResponseOutputAudioTranscriptDone: "response.output_audio_transcript.done",
+	ResponseOutputItemDone: "response.output_item.done",
 	ResponseDone: "response.done",
 	Error: "error",
 	ConversationItemInputAudioTranscriptionCompleted:
@@ -51,7 +58,7 @@ const EVENTS = {
 	RateLimitsUpdated: "rate_limits.updated",
 };
 
-/** OpenAI Realtime API (beta interface, G.711 μ-law passthrough). */
+/** OpenAI Realtime API, GA interface, G.711 μ-law passthrough. */
 export class OpenAIRealtimeProvider implements RealtimeProvider {
 	readonly name = "openai";
 	private ws: WebSocket | null = null;
@@ -65,15 +72,13 @@ export class OpenAIRealtimeProvider implements RealtimeProvider {
 
 	connect(): Promise<void> {
 		if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not set");
-		const url = `wss://api.openai.com/v1/realtime?model=${OPENAI_MODEL || "gpt-realtime-mini"}`;
+		const model = OPENAI_MODEL?.trim() || "gpt-realtime-mini";
+		const url = `wss://api.openai.com/v1/realtime?model=${model}`;
 		this.logger.info(`🔌 Connecting to OpenAI at ${url}`);
 
 		return new Promise((resolve, reject) => {
 			const ws = new WebSocket(url, {
-				headers: {
-					Authorization: `Bearer ${OPENAI_API_KEY}`,
-					"OpenAI-Beta": "realtime=v1",
-				},
+				headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
 			});
 			this.ws = ws;
 
@@ -110,9 +115,16 @@ export class OpenAIRealtimeProvider implements RealtimeProvider {
 		this.send({
 			type: "session.update",
 			session: {
+				type: "realtime",
+				output_modalities: ["audio"],
 				instructions: config.instructions,
 				tools: config.tools,
-				...SESSION_CONFIG,
+				tool_choice: "auto",
+				max_output_tokens: parseInt(
+					process.env.MAX_OUTPUT_TOKENS || "4096",
+					10,
+				),
+				audio: sessionAudio(turnDetection()),
 			},
 		});
 		this.logger.info("✅ Session config sent to OpenAI");
@@ -144,10 +156,14 @@ export class OpenAIRealtimeProvider implements RealtimeProvider {
 		this.send({
 			type: "session.update",
 			session: {
-				turn_detection: {
-					...SESSION_CONFIG.turn_detection,
-					interrupt_response: false,
-					create_response: false,
+				type: "realtime",
+				audio: {
+					input: {
+						turn_detection: turnDetection({
+							interrupt_response: false,
+							create_response: false,
+						}),
+					},
 				},
 			},
 		});
@@ -167,8 +183,6 @@ export class OpenAIRealtimeProvider implements RealtimeProvider {
 	private handleMessage(data: RawData) {
 		try {
 			const event = JSON.parse(data.toString());
-			console.log("-------------------- event --------------------");
-			console.log(event);
 
 			// biome-ignore lint/suspicious/noExplicitAny: OpenAI event payloads
 			const handlers: Record<string, (e: any) => void> = {
@@ -183,16 +197,16 @@ export class OpenAIRealtimeProvider implements RealtimeProvider {
 					this.pendingGreeting = null;
 					this.send({
 						type: "response.create",
-						response: { modalities: ["text", "audio"], instructions },
+						response: { instructions },
 					});
 				},
-				[EVENTS.ResponseAudioDelta]: (e) => {
+				[EVENTS.ResponseOutputAudioDelta]: (e) => {
 					if (e.delta) this.handlers.onAudio(e.delta, e.item_id);
 				},
-				[EVENTS.ResponseAudioTranscriptDelta]: (e) => {
+				[EVENTS.ResponseOutputAudioTranscriptDelta]: (e) => {
 					if (e.delta) this.handlers.onAiTranscriptDelta(e.delta);
 				},
-				[EVENTS.ResponseAudioTranscriptDone]: (e) =>
+				[EVENTS.ResponseOutputAudioTranscriptDone]: (e) =>
 					this.handlers.onAiTranscriptDone(e.transcript ?? ""),
 				[EVENTS.InputAudioBufferSpeechStarted]: () =>
 					this.handlers.onSpeechStarted(),
@@ -201,12 +215,15 @@ export class OpenAIRealtimeProvider implements RealtimeProvider {
 				},
 				[EVENTS.ConversationItemInputAudioTranscriptionFailed]: (e) =>
 					this.logger.error({ error: e.error }, "🔥 Transcription failed"),
-				[EVENTS.ResponseFunctionCallArgumentsDone]: (e) =>
+				[EVENTS.ResponseOutputItemDone]: (e) => {
+					const item = e.item;
+					if (item?.type !== "function_call") return;
 					this.handlers.onFunctionCall({
-						callId: e.call_id,
-						name: e.name,
-						args: e.arguments,
-					}),
+						callId: item.call_id,
+						name: item.name,
+						args: item.arguments,
+					});
+				},
 				[EVENTS.ResponseDone]: () => this.handlers.onResponseDone(),
 				[EVENTS.Error]: (e) =>
 					this.handlers.onError(e.error?.message || "OpenAI error", e.error),
