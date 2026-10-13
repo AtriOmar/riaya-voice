@@ -4,6 +4,10 @@ import {
 	stt,
 } from "@livekit/agents";
 import { type AudioFrame, combineAudioFrames } from "@livekit/rtc-node";
+import {
+	buildGeminiTranscriptPrompt,
+	maxTranscriptTokens,
+} from "./geminiPrompt.js";
 import { toWav } from "./maiStt.js";
 
 /**
@@ -20,23 +24,10 @@ export type GeminiSTTOptions = {
 	model?: string;
 	/** Phrases to bias spelling (city and speciality names). */
 	phrases?: string[];
+	/** `none` for models that put their answer in the reasoning field (e.g. xiaomi/mimo). */
+	reasoningEffort?: "none" | "minimal";
 	onTiming?: (info: { ms: number; chars: number }) => void;
 };
-
-const buildPrompt = (phrases: string[]) =>
-	[
-		"Transcribe this phone call audio exactly as spoken, word for word.",
-		"The caller speaks only Tunisian Arabic (Derja), French or English, and often mixes them in one sentence.",
-		"Write Arabic words in Arabic script and French or English words in Latin letters (e.g. rendez-vous, dermatologue).",
-		"Do not translate, summarize, correct or answer. Do not add any commentary.",
-		"If there is no clear speech, output nothing.",
-		phrases.length > 0
-			? `Names that may appear (use these spellings): ${phrases.join(", ")}.`
-			: "",
-		"Output only the transcript.",
-	]
-		.filter(Boolean)
-		.join(" ");
 
 export class GeminiTranscribeSTT extends stt.STT {
 	label = "openrouter.GeminiTranscribeSTT";
@@ -44,6 +35,7 @@ export class GeminiTranscribeSTT extends stt.STT {
 	#model: string;
 	#prompt: string;
 	#onTiming?: GeminiSTTOptions["onTiming"];
+	#reasoningEffort: "none" | "minimal";
 
 	constructor(opts: GeminiSTTOptions = {}) {
 		super({ streaming: false, interimResults: false });
@@ -51,8 +43,9 @@ export class GeminiTranscribeSTT extends stt.STT {
 		if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
 		this.#apiKey = apiKey;
 		this.#model = opts.model ?? "google/gemini-3.8-flash";
-		this.#prompt = buildPrompt(opts.phrases ?? []);
+		this.#prompt = buildGeminiTranscriptPrompt(opts.phrases ?? []);
 		this.#onTiming = opts.onTiming;
+		this.#reasoningEffort = opts.reasoningEffort ?? "minimal";
 	}
 
 	get model() {
@@ -79,7 +72,10 @@ export class GeminiTranscribeSTT extends stt.STT {
 			},
 			body: JSON.stringify({
 				model: this.#model,
-				reasoning: { effort: "minimal" },
+				reasoning: { effort: this.#reasoningEffort },
+				max_tokens: maxTranscriptTokens(
+					frame.samplesPerChannel / frame.sampleRate,
+				),
 				temperature: 0,
 				messages: [
 					{
