@@ -8,6 +8,11 @@ import {
 	type RealtimeFunctionCall,
 	type RealtimeProvider,
 } from "../realtime/index.js";
+import type { RealtimeHandlers } from "../realtime/types.js";
+import {
+	type CallSettings,
+	loadCallSettings,
+} from "../settings/callSettings.js";
 import {
 	CallTools,
 	consoleLogToolHttpError,
@@ -44,10 +49,10 @@ function getTwilioRestClient(): ReturnType<typeof twilio> | null {
 
 export class TwilioSession {
 	// Connection state
-	private readonly provider: RealtimeProvider;
+	private provider: RealtimeProvider | null = null;
 	private readonly tools: CallTools;
 	/** Separate caller transcription; null when CALLER_STT=off (use the realtime model's transcript). */
-	private readonly callerTranscriber: CallerTranscriber | null;
+	private callerTranscriber: CallerTranscriber | null = null;
 	/** Provider connection is open and can accept `start()`. */
 	private providerReady = false;
 	private streamSid: string | null = null;
@@ -110,11 +115,18 @@ export class TwilioSession {
 		private readonly logger: Logger,
 		private readonly systemMessage: SystemMessage,
 		private readonly dashboardClients: Set<WebSocket>,
+		/** Test-call page only: call id whose per-call model settings live in Redis. */
+		private readonly settingsSid: string | null = null,
 	) {
 		this.logger.info("🟢 TwilioSession created");
 		this.tools = this.createTools();
-		this.callerTranscriber = this.createCallerTranscriber();
-		this.provider = createRealtimeProvider(this.logger, {
+		this.initialize().catch((error) =>
+			this.logger.error({ error }, "🔥 Failed to initialize TwilioSession"),
+		);
+	}
+
+	private realtimeHandlers(): RealtimeHandlers {
+		return {
 			onReady: () => {
 				this.providerReady = true;
 				this.trySendInitialGreeting();
@@ -136,14 +148,18 @@ export class TwilioSession {
 			},
 			onError: (message, detail) => this.handleProviderError(message, detail),
 			onClose: () => this.dispose(),
-		});
-		this.initialize().catch((error) =>
-			this.logger.error({ error }, "🔥 Failed to initialize TwilioSession"),
-		);
+		};
 	}
 
-	private createCallerTranscriber(): CallerTranscriber | null {
-		const mode = process.env.CALLER_STT?.trim().toLowerCase();
+	private createCallerTranscriber(
+		override?: NonNullable<CallSettings["phone"]>["callerStt"],
+	): CallerTranscriber | null {
+		if (override?.api === "off") return null;
+		const mode = override
+			? override.api === "openrouter-chat"
+				? "openrouter-chat"
+				: "openrouter"
+			: process.env.CALLER_STT?.trim().toLowerCase();
 		if (mode !== "openrouter" && mode !== "openrouter-chat") return null;
 		const apiKey = process.env.OPENROUTER_API_KEY;
 		if (!apiKey) {
@@ -153,7 +169,9 @@ export class TwilioSession {
 			return null;
 		}
 		const model =
-			process.env.CALLER_STT_MODEL?.trim() || "google/gemini-3.5-transcribe";
+			override?.model ||
+			process.env.CALLER_STT_MODEL?.trim() ||
+			"google/gemini-3.5-transcribe";
 		this.logger.info({ model }, "🎙️ Separate caller transcription enabled");
 		return new CallerTranscriber({
 			logger: this.logger,
@@ -161,7 +179,8 @@ export class TwilioSession {
 			model,
 			api: mode === "openrouter-chat" ? "chat" : "transcription",
 			reasoningEffort:
-				process.env.GEMINI_STT_REASONING?.trim() === "none"
+				(override?.reasoning ?? process.env.GEMINI_STT_REASONING?.trim()) ===
+				"none"
 					? "none"
 					: "minimal",
 			onTranscript: (text) => this.handlePatientTranscript(text),
@@ -199,8 +218,25 @@ export class TwilioSession {
 		// Set up Twilio handlers FIRST so we don't miss early events (start, connected)
 		// that Twilio sends immediately after the WebSocket is established
 		this.setupTwilioHandlers();
-		this.logger.info(`🔌 Realtime provider: ${this.provider.name}`);
-		await this.provider.connect();
+		const settings = await loadCallSettings(this.settingsSid, this.logger);
+		this.callerTranscriber = this.createCallerTranscriber(
+			settings?.phone?.callerStt,
+		);
+		const realtime = settings?.phone?.realtime;
+		const provider = createRealtimeProvider(
+			this.logger,
+			this.realtimeHandlers(),
+			realtime
+				? {
+						backend: realtime.backend,
+						model: realtime.model,
+						voice: realtime.voice,
+					}
+				: undefined,
+		);
+		this.provider = provider;
+		this.logger.info(`🔌 Realtime provider: ${provider.name}`);
+		await provider.connect();
 	}
 
 	private buildSessionInstructions(): string {
@@ -243,7 +279,7 @@ export class TwilioSession {
 		if (!this.personProfileResolved) return;
 
 		this.initialGreetingSent = true;
-		this.provider.start(
+		this.provider?.start(
 			{
 				instructions: this.buildSessionInstructions(),
 				tools: this.systemMessage.tools,
@@ -267,7 +303,7 @@ export class TwilioSession {
 	/** Refresh instructions after the session started (profile / language changed). */
 	private sendSessionConfig() {
 		if (!this.initialGreetingSent) return;
-		this.provider.updateSession({
+		this.provider?.updateSession({
 			instructions: this.buildSessionInstructions(),
 			tools: this.systemMessage.tools,
 			language: this.callerPreferredLanguage,
@@ -439,7 +475,7 @@ export class TwilioSession {
 					this.latestMediaTimestamp = parseInt(msg.media.timestamp, 10);
 
 					// Forward audio to the realtime model
-					this.provider.sendAudio(msg.media.payload);
+					this.provider?.sendAudio(msg.media.payload);
 					this.callerTranscriber?.push(msg.media.payload);
 
 					// Forward audio to dashboard clients listening to this call
@@ -533,7 +569,7 @@ export class TwilioSession {
 
 			// Tell the model how much of the reply the caller actually heard
 			if (this.lastAssistantItem) {
-				this.provider.truncate(this.lastAssistantItem, elapsedTime);
+				this.provider?.truncate(this.lastAssistantItem, elapsedTime);
 			}
 
 			// Tell Twilio to clear its audio buffer
@@ -554,7 +590,7 @@ export class TwilioSession {
 	// ==================== Function Calling ====================
 
 	private sendFunctionCallOutput(call: RealtimeFunctionCall, output: string) {
-		this.provider.sendFunctionResult(call, output);
+		this.provider?.sendFunctionResult(call, output);
 	}
 
 	private onResponseDone() {
@@ -830,7 +866,7 @@ export class TwilioSession {
 				// Set before sending the result so the goodbye audio is recognised.
 				this.pendingHangup = true;
 				this.goodbyeAudioStarted = false;
-				this.provider.enterClosingMode();
+				this.provider?.enterClosingMode();
 				this.scheduleFallbackHangup();
 			}
 
@@ -924,7 +960,7 @@ export class TwilioSession {
 		this.clearHangupTimers();
 		this.callerTranscriber?.close();
 
-		this.provider.close();
+		this.provider?.close();
 
 		if (this.twilioWs) {
 			this.twilioWs.removeAllListeners();

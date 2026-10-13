@@ -12,9 +12,7 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL?.trim() || "gemini-3.8-live";
 const GEMINI_VOICE = process.env.GEMINI_VOICE?.trim() || "Puck";
 /** low | medium | high — required by `*-extended-thinking` models, optional otherwise. */
-const GEMINI_THINKING_LEVEL =
-	process.env.GEMINI_THINKING_LEVEL?.trim() ||
-	(GEMINI_MODEL.includes("thinking") ? "low" : undefined);
+export type GeminiLiveOptions = { model?: string; voice?: string };
 const SILENCE_DURATION_MS = parseInt(
 	process.env.SILENCE_DURATION_MS || "600",
 	10,
@@ -64,14 +62,25 @@ export class GeminiLiveProvider implements RealtimeProvider {
 	private patientTranscript = "";
 	private aiTranscript = "";
 
+	private readonly model: string;
+	private readonly voice: string;
+	private readonly thinkingLevel: string | undefined;
+
 	constructor(
 		private readonly logger: Logger,
 		private readonly handlers: RealtimeHandlers,
-	) {}
+		opts: GeminiLiveOptions = {},
+	) {
+		this.model = opts.model ?? GEMINI_MODEL;
+		this.voice = opts.voice ?? GEMINI_VOICE;
+		this.thinkingLevel =
+			process.env.GEMINI_THINKING_LEVEL?.trim() ||
+			(this.model.includes("thinking") ? "low" : undefined);
+	}
 
 	connect(): Promise<void> {
 		if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not set");
-		this.logger.info(`🔌 Connecting to Gemini Live (${GEMINI_MODEL})`);
+		this.logger.info(`🔌 Connecting to Gemini Live (${this.model})`);
 
 		return new Promise((resolve, reject) => {
 			const ws = new WebSocket(`${LIVE_URL}?key=${GEMINI_API_KEY}`);
@@ -108,14 +117,14 @@ export class GeminiLiveProvider implements RealtimeProvider {
 		this.pendingGreeting = greetingInstructions;
 		this.send({
 			setup: {
-				model: `models/${GEMINI_MODEL}`,
+				model: `models/${this.model}`,
 				generationConfig: {
 					responseModalities: ["AUDIO"],
 					speechConfig: {
-						voiceConfig: { prebuiltVoiceConfig: { voiceName: GEMINI_VOICE } },
+						voiceConfig: { prebuiltVoiceConfig: { voiceName: this.voice } },
 					},
-					...(GEMINI_THINKING_LEVEL
-						? { thinkingConfig: { thinkingLevel: GEMINI_THINKING_LEVEL } }
+					...(this.thinkingLevel
+						? { thinkingConfig: { thinkingLevel: this.thinkingLevel } }
 						: {}),
 				},
 				systemInstruction: { parts: [{ text: config.instructions }] },

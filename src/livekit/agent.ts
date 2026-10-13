@@ -28,6 +28,10 @@ import {
 } from "../sessions/callInstructions.js";
 import { getSystemMessage } from "../sessions/systemMessages.js";
 import {
+	type CallSettings,
+	loadCallSettings,
+} from "../settings/callSettings.js";
+import {
 	CallTools,
 	type PersonRow,
 	toolFailureMessage,
@@ -228,6 +232,146 @@ const logger = pino({
 	transport: { target: "pino-pretty", options: { colorize: true } },
 });
 
+// ==================== Per-call pipeline config ====================
+
+/** Everything that picks the STT / LLM / TTS models, starting from `.env`. */
+type PipelineConfig = {
+	sttModel: string;
+	geminiProvider: "openrouter" | "google";
+	geminiSttModel: string;
+	googleSttModel: string;
+	sttReasoning: "none" | "minimal";
+	whisperModel: string;
+	llmProvider: string;
+	livekitLlmModel: string;
+	geminiLlmModel: string;
+	googleLlmModel: string;
+	openrouterModel: string;
+	ttsProvider: string;
+	openrouterTtsModel: string;
+	openrouterTtsVoice: string;
+	googleTtsModel: string;
+	googleTtsVoice: string;
+	geminiOpenrouterTtsModel: string;
+	geminiOpenrouterTtsVoice: string;
+	openaiTtsModel: string;
+	openaiTtsVoice: string;
+	openaiTtsInstructions: string | undefined;
+	ttsInferenceModel: string;
+	ttsInferenceVoice: string | undefined;
+	inworldVoice: string;
+	inworldTtsModel: string;
+};
+
+const ENV_PIPELINE: PipelineConfig = {
+	sttModel: STT_MODEL,
+	geminiProvider: GEMINI_PROVIDER,
+	geminiSttModel: GEMINI_STT_MODEL,
+	googleSttModel: GOOGLE_STT_MODEL,
+	sttReasoning: GEMINI_STT_REASONING,
+	whisperModel: OPENROUTER_WHISPER_MODEL,
+	llmProvider: LLM_PROVIDER,
+	livekitLlmModel: LIVEKIT_LLM_MODEL,
+	geminiLlmModel: GEMINI_LLM_MODEL,
+	googleLlmModel: GOOGLE_LLM_MODEL,
+	openrouterModel: OPENROUTER_MODEL,
+	ttsProvider: TTS_PROVIDER,
+	openrouterTtsModel: OPENROUTER_TTS_MODEL,
+	openrouterTtsVoice: OPENROUTER_TTS_VOICE,
+	googleTtsModel: GOOGLE_TTS_MODEL,
+	googleTtsVoice: GOOGLE_TTS_VOICE,
+	geminiOpenrouterTtsModel: GEMINI_OPENROUTER_TTS_MODEL,
+	geminiOpenrouterTtsVoice: GEMINI_OPENROUTER_TTS_VOICE,
+	openaiTtsModel: OPENAI_TTS_MODEL,
+	openaiTtsVoice: OPENAI_TTS_VOICE,
+	openaiTtsInstructions: OPENAI_TTS_INSTRUCTIONS,
+	ttsInferenceModel: TTS_INFERENCE_MODEL,
+	ttsInferenceVoice: TTS_INFERENCE_VOICE,
+	inworldVoice: INWORLD_VOICE,
+	inworldTtsModel: INWORLD_TTS_MODEL,
+};
+
+/** Test-call page choices on top of `.env`; any combination is accepted. */
+function resolvePipeline(
+	settings: CallSettings["pipeline"] | undefined,
+): PipelineConfig {
+	const cfg: PipelineConfig = { ...ENV_PIPELINE };
+	if (!settings) return cfg;
+
+	const { stt, llm, tts } = settings;
+	if (stt) {
+		switch (stt.api) {
+			case "openrouter-chat":
+				cfg.sttModel = "openrouter-gemini";
+				cfg.geminiSttModel = stt.model;
+				cfg.sttReasoning = stt.reasoning ?? "minimal";
+				break;
+			case "openrouter-transcription":
+				cfg.sttModel = "whisper";
+				cfg.whisperModel = stt.model;
+				break;
+			case "google":
+				cfg.sttModel = "google-gemini";
+				cfg.googleSttModel = stt.model;
+				break;
+			case "inworld":
+				cfg.sttModel = "inworld";
+				break;
+			case "openai":
+			case "livekit-inference":
+				cfg.sttModel = stt.model;
+				break;
+		}
+	}
+	if (llm) {
+		if (llm.provider === "openrouter") {
+			cfg.llmProvider = "openrouter";
+			cfg.openrouterModel = llm.model;
+		} else if (llm.provider === "google") {
+			cfg.llmProvider = "google-gemini";
+			cfg.googleLlmModel = llm.model;
+		} else {
+			cfg.llmProvider = "livekit";
+			cfg.livekitLlmModel = llm.model;
+		}
+	}
+	if (tts) {
+		switch (tts.provider) {
+			case "gemini-openrouter":
+				cfg.ttsProvider = "gemini-openrouter";
+				cfg.geminiOpenrouterTtsModel = tts.model;
+				if (tts.voice) cfg.geminiOpenrouterTtsVoice = tts.voice;
+				break;
+			case "gemini-google":
+				cfg.ttsProvider = "gemini-google";
+				cfg.googleTtsModel = tts.model;
+				if (tts.voice) cfg.googleTtsVoice = tts.voice;
+				break;
+			case "openai":
+				cfg.ttsProvider = "openai";
+				cfg.openaiTtsModel = tts.model;
+				if (tts.voice) cfg.openaiTtsVoice = tts.voice;
+				break;
+			case "openrouter":
+				cfg.ttsProvider = "openrouter";
+				cfg.openrouterTtsModel = tts.model;
+				if (tts.voice) cfg.openrouterTtsVoice = tts.voice;
+				break;
+			case "inworld":
+				cfg.ttsProvider = "inworld";
+				cfg.inworldTtsModel = tts.model;
+				if (tts.voice) cfg.inworldVoice = tts.voice;
+				break;
+			case "inference":
+				cfg.ttsProvider = "inference";
+				cfg.ttsInferenceModel = tts.model;
+				cfg.ttsInferenceVoice = tts.voice;
+				break;
+		}
+	}
+	return cfg;
+}
+
 export default defineAgent({
 	prewarm: async (proc: JobProcess) => {
 		proc.userData.vad = await silero.VAD.load();
@@ -293,6 +437,9 @@ export default defineAgent({
 			}) + (PROFILE_CAPTURE === "background" ? PROFILE_CAPTURE_NOTE : "");
 
 		// ---------- pipeline ----------
+		// Test-call page choices (simulated calls only); `.env` otherwise.
+		const callSettings = await loadCallSettings(callSid, log);
+		const cfg = resolvePipeline(callSettings?.pipeline);
 		const sttHint =
 			STT_LANGUAGE_HINT === "call"
 				? (STT_LANGUAGE[language] as LanguageCode)
@@ -301,81 +448,98 @@ export default defineAgent({
 		// them with VAD and only has a transcript once the utterance is already
 		// final, so there is nothing for preemptive generation to speculate on.
 		const sttIsStreaming =
-			STT_MODEL !== "mai" &&
-			STT_MODEL !== "gemini" &&
-			STT_MODEL !== "openrouter-gemini" &&
-			STT_MODEL !== "whisper";
+			cfg.sttModel !== "mai" &&
+			cfg.sttModel !== "gemini" &&
+			cfg.sttModel !== "openrouter-gemini" &&
+			cfg.sttModel !== "google-gemini" &&
+			cfg.sttModel !== "whisper";
 		const stt = GPT_LIVE
 			? null
-			: STT_MODEL === "gemini"
-				? (GEMINI_PROVIDER === "google"
-						? createGoogleGeminiStt
-						: createOpenRouterGeminiStt)({
-						model:
-							GEMINI_PROVIDER === "google"
-								? GOOGLE_STT_MODEL
-								: GEMINI_STT_MODEL,
-						phrases: MAI_PHRASES,
+			: cfg.sttModel === "google-gemini"
+				? createGoogleGeminiStt({
+						model: cfg.googleSttModel,
 						onTiming: ({ ms, chars }) =>
 							log.info({ ms, chars }, "🎙️ STT request time"),
 					})
-				: STT_MODEL === "openrouter-gemini"
-					? createOpenRouterGeminiStt({
-							model: GEMINI_STT_MODEL,
+				: cfg.sttModel === "gemini"
+					? (cfg.geminiProvider === "google"
+							? createGoogleGeminiStt
+							: createOpenRouterGeminiStt)({
+							model:
+								cfg.geminiProvider === "google"
+									? cfg.googleSttModel
+									: cfg.geminiSttModel,
 							phrases: MAI_PHRASES,
-							reasoningEffort: GEMINI_STT_REASONING,
 							onTiming: ({ ms, chars }) =>
 								log.info({ ms, chars }, "🎙️ STT request time"),
 						})
-					: STT_MODEL === "whisper"
-						? new OpenRouterTranscribeSTT({ model: OPENROUTER_WHISPER_MODEL })
-						: STT_MODEL === "mai"
-							? new MaiTranscribeSTT({
-									fallbackLanguage: STT_LANGUAGE[language],
-									phrases: MAI_PHRASES,
-								})
-							: STT_MODEL === "inworld"
-								? new inworld.STT({ language: STT_LANGUAGE[language] })
-								: STT_MODEL.startsWith("gpt-")
-									? new openai.STT({
-											model: STT_MODEL,
-											language: sttHint,
-											// Without a hint the plugin would default to English.
-											detectLanguage: sttHint === undefined,
-										})
-									: new inference.STT({ model: STT_MODEL, language: sttHint });
+					: cfg.sttModel === "openrouter-gemini"
+						? createOpenRouterGeminiStt({
+								model: cfg.geminiSttModel,
+								phrases: MAI_PHRASES,
+								reasoningEffort: cfg.sttReasoning,
+								onTiming: ({ ms, chars }) =>
+									log.info({ ms, chars }, "🎙️ STT request time"),
+							})
+						: cfg.sttModel === "whisper"
+							? new OpenRouterTranscribeSTT({ model: cfg.whisperModel })
+							: cfg.sttModel === "mai"
+								? new MaiTranscribeSTT({
+										fallbackLanguage: STT_LANGUAGE[language],
+										phrases: MAI_PHRASES,
+									})
+								: cfg.sttModel === "inworld"
+									? new inworld.STT({ language: STT_LANGUAGE[language] })
+									: cfg.sttModel.startsWith("gpt-")
+										? new openai.STT({
+												model: cfg.sttModel,
+												language: sttHint,
+												// Without a hint the plugin would default to English.
+												detectLanguage: sttHint === undefined,
+											})
+										: new inference.STT({
+												model: cfg.sttModel,
+												language: sttHint,
+											});
 		const tts = GPT_LIVE
 			? null
-			: TTS_PROVIDER === "openrouter"
-				? new openai.TTS({
-						baseURL: "https://openrouter.ai/api/v1",
-						apiKey: process.env.OPENROUTER_API_KEY,
-						model: OPENROUTER_TTS_MODEL,
-						voice: OPENROUTER_TTS_VOICE as OpenAIVoice,
-					})
-				: TTS_PROVIDER === "gemini"
-					? GEMINI_PROVIDER === "google"
-						? createGoogleGeminiTts(GOOGLE_TTS_MODEL, GOOGLE_TTS_VOICE)
-						: createOpenRouterGeminiTts(
-								GEMINI_OPENROUTER_TTS_MODEL,
-								GEMINI_OPENROUTER_TTS_VOICE,
-							)
-					: TTS_PROVIDER === "openai"
-						? createOpenAiTts({
-								model: OPENAI_TTS_MODEL,
-								voice: OPENAI_TTS_VOICE,
-								instructions: OPENAI_TTS_INSTRUCTIONS,
+			: cfg.ttsProvider === "gemini-google"
+				? createGoogleGeminiTts(cfg.googleTtsModel, cfg.googleTtsVoice)
+				: cfg.ttsProvider === "gemini-openrouter"
+					? createOpenRouterGeminiTts(
+							cfg.geminiOpenrouterTtsModel,
+							cfg.geminiOpenrouterTtsVoice,
+						)
+					: cfg.ttsProvider === "openrouter"
+						? new openai.TTS({
+								baseURL: "https://openrouter.ai/api/v1",
+								apiKey: process.env.OPENROUTER_API_KEY,
+								model: cfg.openrouterTtsModel,
+								voice: cfg.openrouterTtsVoice as OpenAIVoice,
 							})
-						: TTS_PROVIDER === "inference"
-							? new inference.TTS({
-									model: TTS_INFERENCE_MODEL,
-									voice: TTS_INFERENCE_VOICE,
-								})
-							: new inworld.TTS({
-									model: INWORLD_TTS_MODEL,
-									voice: INWORLD_VOICE,
-									language: TTS_LANGUAGE[language],
-								});
+						: cfg.ttsProvider === "gemini"
+							? cfg.geminiProvider === "google"
+								? createGoogleGeminiTts(cfg.googleTtsModel, cfg.googleTtsVoice)
+								: createOpenRouterGeminiTts(
+										cfg.geminiOpenrouterTtsModel,
+										cfg.geminiOpenrouterTtsVoice,
+									)
+							: cfg.ttsProvider === "openai"
+								? createOpenAiTts({
+										model: cfg.openaiTtsModel,
+										voice: cfg.openaiTtsVoice,
+										instructions: cfg.openaiTtsInstructions,
+									})
+								: cfg.ttsProvider === "inference"
+									? new inference.TTS({
+											model: cfg.ttsInferenceModel,
+											voice: cfg.ttsInferenceVoice,
+										})
+									: new inworld.TTS({
+											model: cfg.inworldTtsModel,
+											voice: cfg.inworldVoice,
+											language: TTS_LANGUAGE[language],
+										});
 		const model = GPT_LIVE
 			? new openai.realtime.GPTLiveModel({
 					voice: GPT_LIVE_VOICE,
@@ -383,54 +547,28 @@ export default defineAgent({
 						? { responsesOptions: { model: GPT_LIVE_BACKEND_MODEL } }
 						: {}),
 				})
-			: LLM_PROVIDER === "livekit"
-				? new inference.LLM({ model: LIVEKIT_LLM_MODEL })
-				: LLM_PROVIDER === "gemini"
-					? GEMINI_PROVIDER === "google"
-						? createGoogleGeminiLlm(GOOGLE_LLM_MODEL)
-						: createOpenRouterGeminiLlm(GEMINI_LLM_MODEL)
-					: new openai.LLM({
-							model: OPENROUTER_MODEL,
-							baseURL: "https://openrouter.ai/api/v1",
-							apiKey: process.env.OPENROUTER_API_KEY,
-						});
+			: cfg.llmProvider === "google-gemini"
+				? createGoogleGeminiLlm(cfg.googleLlmModel)
+				: cfg.llmProvider === "livekit"
+					? new inference.LLM({ model: cfg.livekitLlmModel })
+					: cfg.llmProvider === "gemini"
+						? cfg.geminiProvider === "google"
+							? createGoogleGeminiLlm(cfg.googleLlmModel)
+							: createOpenRouterGeminiLlm(cfg.geminiLlmModel)
+						: new openai.LLM({
+								model: cfg.openrouterModel,
+								baseURL: "https://openrouter.ai/api/v1",
+								apiKey: process.env.OPENROUTER_API_KEY,
+							});
 		log.info(
 			{
-				llmProvider: LLM_PROVIDER,
-				sttModel: STT_MODEL === "gemini" ? GEMINI_STT_MODEL : STT_MODEL,
+				perCall: Boolean(callSettings?.pipeline),
+				stt: stt ? `${stt.provider}/${stt.model}` : "gpt-live",
 				sttLanguageHint: STT_LANGUAGE_HINT,
-				ttsProvider: TTS_PROVIDER,
-				ttsVoice:
-					TTS_PROVIDER === "openrouter"
-						? OPENROUTER_TTS_VOICE
-						: TTS_PROVIDER === "gemini"
-							? GEMINI_PROVIDER === "google"
-								? GOOGLE_TTS_VOICE
-								: GEMINI_OPENROUTER_TTS_VOICE
-							: TTS_PROVIDER === "openai"
-								? OPENAI_TTS_VOICE
-								: INWORLD_VOICE,
-				ttsModel:
-					TTS_PROVIDER === "openrouter"
-						? OPENROUTER_TTS_MODEL
-						: TTS_PROVIDER === "gemini"
-							? GEMINI_PROVIDER === "google"
-								? GOOGLE_TTS_MODEL
-								: GEMINI_OPENROUTER_TTS_MODEL
-							: TTS_PROVIDER === "openai"
-								? OPENAI_TTS_MODEL
-								: TTS_PROVIDER === "inference"
-									? TTS_INFERENCE_MODEL
-									: INWORLD_TTS_MODEL,
-				llmModel: GPT_LIVE
+				tts: tts ? `${tts.provider}/${tts.model}` : "gpt-live",
+				llm: GPT_LIVE
 					? `gpt-live (voice ${GPT_LIVE_VOICE}, backend ${GPT_LIVE_BACKEND_MODEL ?? "default"})`
-					: LLM_PROVIDER === "livekit"
-						? LIVEKIT_LLM_MODEL
-						: LLM_PROVIDER === "gemini"
-							? GEMINI_PROVIDER === "google"
-								? GOOGLE_LLM_MODEL
-								: GEMINI_LLM_MODEL
-							: OPENROUTER_MODEL,
+					: `${model.provider}/${model.model}`,
 			},
 			"🧠 LLM",
 		);

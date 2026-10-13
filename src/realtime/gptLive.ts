@@ -102,6 +102,8 @@ type ServerEvent = {
 	reason?: string | null;
 };
 
+export type GptLiveOptions = { model?: string; voice?: string };
+
 export class GptLiveProvider implements RealtimeProvider {
 	readonly name = "gpt-live";
 	private ws: WebSocket | null = null;
@@ -134,6 +136,7 @@ export class GptLiveProvider implements RealtimeProvider {
 	constructor(
 		private readonly logger: Logger,
 		private readonly handlers: RealtimeHandlers,
+		private readonly opts: GptLiveOptions = {},
 	) {}
 
 	connect(): Promise<void> {
@@ -177,12 +180,18 @@ export class GptLiveProvider implements RealtimeProvider {
 			type: "session.start",
 			event_id: this.eventId("start"),
 			session: {
-				model: process.env.GPT_LIVE_MODEL?.trim() || DEFAULT_MODEL,
+				model:
+					this.opts.model ||
+					process.env.GPT_LIVE_MODEL?.trim() ||
+					DEFAULT_MODEL,
 				instructions: config.instructions + VOICE_ROLE_NOTE,
 				audio: {
 					format: AUDIO_FORMAT,
 					output: {
-						voice: process.env.GPT_LIVE_VOICE?.trim() || DEFAULT_VOICE,
+						voice:
+							this.opts.voice ||
+							process.env.GPT_LIVE_VOICE?.trim() ||
+							DEFAULT_VOICE,
 					},
 				},
 				delegation: {

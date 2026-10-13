@@ -4,6 +4,8 @@ Every model we try for the LiveKit agent, with the verdict from testing. Update 
 
 Verdicts: **good**, **ok**, **bad**, or **untested**. Notes give the reason in short.
 
+The /test-call page's model selects use a copy of these ratings and prices in `web/src/lib/test-call-models.ts`. When a rating or price changes here, update that file too.
+
 Prices are from OpenRouter's model list, checked 2026-10-11. LLM and speech output prices are per million tokens. "Not checked" means the model runs on another provider and I couldn't read its price here.
 
 ## STT (speech-to-text) — `STT_MODEL`

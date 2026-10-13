@@ -298,7 +298,7 @@ server.on("upgrade", (request, socket, head) => {
 
 // ==================== Twilio Media Stream Connections ====================
 
-twilioWss.on("connection", (ws: WebSocket) => {
+twilioWss.on("connection", (ws: WebSocket, request: http.IncomingMessage) => {
 	logger.info("📞 Twilio media stream connected");
 
 	const systemMessage = getSystemMessage("doctor-appointment");
@@ -309,7 +309,12 @@ twilioWss.on("connection", (ws: WebSocket) => {
 	}
 
 	// Each Twilio call gets its own session that bridges Twilio ↔ OpenAI ↔ Dashboard
-	new TwilioSession(ws, logger, systemMessage, dashboardClients);
+	// Test-call page only: `?cs=<callSid>` points at per-call model settings in Redis.
+	const settingsSid = new URL(
+		request.url ?? "/",
+		"http://localhost",
+	).searchParams.get("cs");
+	new TwilioSession(ws, logger, systemMessage, dashboardClients, settingsSid);
 });
 
 // ==================== LiveKit Agent Event Relay ====================

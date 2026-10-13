@@ -26,7 +26,7 @@ function turnDetection(extra: Record<string, unknown> = {}) {
 	};
 }
 
-function sessionAudio(turn: Record<string, unknown>) {
+function sessionAudio(turn: Record<string, unknown>, voice: string) {
 	return {
 		input: {
 			format: AUDIO_FORMAT,
@@ -37,7 +37,7 @@ function sessionAudio(turn: Record<string, unknown>) {
 			},
 			turn_detection: turn,
 		},
-		output: { format: AUDIO_FORMAT, voice: VOICE },
+		output: { format: AUDIO_FORMAT, voice },
 	};
 }
 
@@ -58,6 +58,8 @@ const EVENTS = {
 	RateLimitsUpdated: "rate_limits.updated",
 };
 
+export type OpenAIRealtimeOptions = { model?: string; voice?: string };
+
 /** OpenAI Realtime API, GA interface, G.711 μ-law passthrough. */
 export class OpenAIRealtimeProvider implements RealtimeProvider {
 	readonly name = "openai";
@@ -65,15 +67,21 @@ export class OpenAIRealtimeProvider implements RealtimeProvider {
 	private started = false;
 	private pendingGreeting: string | null = null;
 
+	private readonly model: string;
+	private readonly voice: string;
+
 	constructor(
 		private readonly logger: Logger,
 		private readonly handlers: RealtimeHandlers,
-	) {}
+		opts: OpenAIRealtimeOptions = {},
+	) {
+		this.model = opts.model ?? (OPENAI_MODEL?.trim() || "gpt-realtime-mini");
+		this.voice = opts.voice ?? VOICE;
+	}
 
 	connect(): Promise<void> {
 		if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not set");
-		const model = OPENAI_MODEL?.trim() || "gpt-realtime-mini";
-		const url = `wss://api.openai.com/v1/realtime?model=${model}`;
+		const url = `wss://api.openai.com/v1/realtime?model=${this.model}`;
 		this.logger.info(`🔌 Connecting to OpenAI at ${url}`);
 
 		return new Promise((resolve, reject) => {
@@ -124,7 +132,7 @@ export class OpenAIRealtimeProvider implements RealtimeProvider {
 					process.env.MAX_OUTPUT_TOKENS || "4096",
 					10,
 				),
-				audio: sessionAudio(turnDetection()),
+				audio: sessionAudio(turnDetection(), this.voice),
 			},
 		});
 		this.logger.info("✅ Session config sent to OpenAI");
