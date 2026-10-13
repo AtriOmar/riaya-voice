@@ -33,7 +33,7 @@ This document is a compact project guide for AI assistants working on this repo.
 - Node.js + Express + TypeScript
 - `ws` WebSocket servers (Twilio stream + dashboard + WhatsApp admin)
 - Twilio media stream handling
-- Azure/OpenAI realtime integration
+- Realtime model integrations (Gemini Live, OpenAI Realtime, GPT-Live, Inworld) and the LiveKit agent
 - Axios (`nextjsApi`) for calling Next API endpoints
 - Pino logging
 
