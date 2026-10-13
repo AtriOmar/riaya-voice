@@ -19,6 +19,7 @@ import type {
 	SystemMessage,
 	TwilioMediaMessage,
 } from "../types/index.js";
+import { CallerTranscriber } from "./callerTranscriber.js";
 import {
 	buildCallInstructions,
 	buildInitialGreetingInstructions,
@@ -45,6 +46,8 @@ export class TwilioSession {
 	// Connection state
 	private readonly provider: RealtimeProvider;
 	private readonly tools: CallTools;
+	/** Separate caller transcription; null when CALLER_STT=off (use the realtime model's transcript). */
+	private readonly callerTranscriber: CallerTranscriber | null;
 	/** Provider connection is open and can accept `start()`. */
 	private providerReady = false;
 	private streamSid: string | null = null;
@@ -110,6 +113,7 @@ export class TwilioSession {
 	) {
 		this.logger.info("🟢 TwilioSession created");
 		this.tools = this.createTools();
+		this.callerTranscriber = this.createCallerTranscriber();
 		this.provider = createRealtimeProvider(this.logger, {
 			onReady: () => {
 				this.providerReady = true;
@@ -118,7 +122,10 @@ export class TwilioSession {
 			onAudio: (payload, itemId) => this.handleAudioDelta(payload, itemId),
 			onAiTranscriptDelta: (delta) => this.handleAiTranscriptDelta(delta),
 			onAiTranscriptDone: (text) => this.handleAiTranscriptDone(text),
-			onPatientTranscript: (text) => this.handlePatientTranscript(text),
+			onPatientTranscript: (text) => {
+				// With a separate transcriber, the realtime model's own transcript is skipped.
+				if (!this.callerTranscriber) this.handlePatientTranscript(text);
+			},
 			onSpeechStarted: () => this.handleSpeechStarted(),
 			onFunctionCall: (call) => {
 				void this.handleFunctionCall(call);
@@ -133,6 +140,32 @@ export class TwilioSession {
 		this.initialize().catch((error) =>
 			this.logger.error({ error }, "🔥 Failed to initialize TwilioSession"),
 		);
+	}
+
+	private createCallerTranscriber(): CallerTranscriber | null {
+		const mode = process.env.CALLER_STT?.trim().toLowerCase();
+		if (mode !== "openrouter" && mode !== "openrouter-chat") return null;
+		const apiKey = process.env.OPENROUTER_API_KEY;
+		if (!apiKey) {
+			this.logger.warn(
+				"CALLER_STT=openrouter but OPENROUTER_API_KEY is not set; using the realtime model's transcript",
+			);
+			return null;
+		}
+		const model =
+			process.env.CALLER_STT_MODEL?.trim() || "google/gemini-3.5-transcribe";
+		this.logger.info({ model }, "🎙️ Separate caller transcription enabled");
+		return new CallerTranscriber({
+			logger: this.logger,
+			apiKey,
+			model,
+			api: mode === "openrouter-chat" ? "chat" : "transcription",
+			reasoningEffort:
+				process.env.GEMINI_STT_REASONING?.trim() === "none"
+					? "none"
+					: "minimal",
+			onTranscript: (text) => this.handlePatientTranscript(text),
+		});
 	}
 
 	private createTools(): CallTools {
@@ -407,6 +440,7 @@ export class TwilioSession {
 
 					// Forward audio to the realtime model
 					this.provider.sendAudio(msg.media.payload);
+					this.callerTranscriber?.push(msg.media.payload);
 
 					// Forward audio to dashboard clients listening to this call
 					if (this.callSid) {
@@ -888,6 +922,7 @@ export class TwilioSession {
 	dispose() {
 		this.logger.info("🗑️ Disposing TwilioSession");
 		this.clearHangupTimers();
+		this.callerTranscriber?.close();
 
 		this.provider.close();
 
