@@ -1,8 +1,12 @@
 import type { Logger } from "pino";
-import twilio from "twilio";
 import { type RawData, WebSocket } from "ws";
+import {
+	type CallerRefusalContext,
+	getCallerRefusalContext,
+} from "../api/callerAppointmentsApi.js";
 import { createCallEvent, ensureCallRow, updateCall } from "../api/callsApi.js";
 import { ensurePersonRow } from "../api/personsApi.js";
+import { getTwilioClient } from "../api/twilioClient.js";
 import {
 	createRealtimeProvider,
 	type RealtimeFunctionCall,
@@ -26,23 +30,17 @@ import type {
 } from "../types/index.js";
 import { CallerTranscriber } from "./callerTranscriber.js";
 import {
+	buildCallbackGreetingInstructions,
 	buildCallInstructions,
 	buildInitialGreetingInstructions,
+	type CallbackReason,
 	type CallLanguage,
+	normalizeCallbackReason,
 	normalizeCallLanguage,
 } from "./callInstructions.js";
 
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-
-let twilioRestClient: ReturnType<typeof twilio> | null = null;
-
-function getTwilioRestClient(): ReturnType<typeof twilio> | null {
-	if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return null;
-	if (!twilioRestClient) {
-		twilioRestClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-	}
-	return twilioRestClient;
+function getTwilioRestClient() {
+	return getTwilioClient();
 }
 
 // ==================== TwilioSession ====================
@@ -69,6 +67,8 @@ export class TwilioSession {
 
 	/** E.164 (or Twilio-provided) caller ID from Stream customParameters */
 	private callerPhone: string | null = null;
+	/** Alternatives to offer when a doctor refused this caller's last request. */
+	private refusalContext: CallerRefusalContext | null = null;
 
 	/** DB id of the person record for this caller (set once callerPhone is known). */
 	private personId: number | null = null;
@@ -109,6 +109,9 @@ export class TwilioSession {
 	 * Twilio REST API.
 	 */
 	private isSimulated = false;
+
+	/** Set when Riaya placed the call (real Twilio callback or test-call page). */
+	private callbackReason: CallbackReason | null = null;
 
 	constructor(
 		private readonly twilioWs: WebSocket,
@@ -244,6 +247,8 @@ export class TwilioSession {
 			language: this.callerPreferredLanguage,
 			firstName: this.callerFirstName,
 			callerPhone: this.callerPhone,
+			refusalContext: this.refusalContext,
+			callbackReason: this.callbackReason,
 		});
 	}
 
@@ -286,10 +291,17 @@ export class TwilioSession {
 				language: this.callerPreferredLanguage,
 				firstName: this.callerFirstName,
 			},
-			buildInitialGreetingInstructions(
-				this.callerPreferredLanguage,
-				this.callerFirstName,
-			),
+			this.callbackReason
+				? buildCallbackGreetingInstructions({
+						lang: this.callerPreferredLanguage,
+						firstName: this.callerFirstName,
+						reason: this.callbackReason,
+						refusedDoctorName: this.refusalContext?.refusedDoctorName,
+					})
+				: buildInitialGreetingInstructions(
+						this.callerPreferredLanguage,
+						this.callerFirstName,
+					),
 		);
 		this.logger.info(
 			{
@@ -423,6 +435,10 @@ export class TwilioSession {
 								: "";
 					const trimmed = raw.trim();
 					this.callerPhone = trimmed.length > 0 ? trimmed : null;
+					this.callbackReason =
+						params.callMode === "callback"
+							? normalizeCallbackReason(params.callbackReason)
+							: null;
 					this.callStartedAt = new Date();
 
 					// Detect simulated browser calls so hangup closes the WS instead
@@ -432,7 +448,11 @@ export class TwilioSession {
 
 					// Ensure person exists (idempotent — /incoming-call likely already started this).
 					if (this.callerPhone) {
-						void ensurePersonRow(this.callerPhone).then((row) => {
+						void Promise.all([
+							ensurePersonRow(this.callerPhone),
+							getCallerRefusalContext(this.callerPhone),
+						]).then(([row, refusalContext]) => {
+							this.refusalContext = refusalContext;
 							if (row != null) {
 								this.applyPersonRow(row);
 								this.sendSessionConfig();
@@ -781,10 +801,7 @@ export class TwilioSession {
 							error: true,
 							message: "end_call: no active call",
 						});
-					} else if (
-						!this.isSimulated &&
-						(!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN)
-					) {
+					} else if (!this.isSimulated && !getTwilioRestClient()) {
 						result = JSON.stringify({
 							error: true,
 							message: "end_call: Twilio credentials not configured",

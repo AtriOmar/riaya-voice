@@ -15,13 +15,14 @@ import { type WebSocket, WebSocketServer } from "ws";
 import { ensureCallRow } from "./api/callsApi.js";
 import { nextjsApi } from "./api/nextjsApiClient.js";
 import { ensurePersonRow } from "./api/personsApi.js";
+import { registerTestCallInbox } from "./services/testCallInbox.js";
 import { whatsappManager } from "./services/whatsappManager.js";
 import type { WhatsappStatus } from "./services/whatsappService.js";
 import { getSystemMessage } from "./sessions/systemMessages.js";
 import { TwilioSession } from "./sessions/twilioSession.js";
 import "./workers/reviewWorker.js"; // Start the review worker
 import "./workers/subscriptionWorker.js"; // Start the subscription cron worker
-import "./workers/pendingTimeoutWorker.js"; // Auto-cancel unanswered AI pending appointments
+import { handleCallbackStatus } from "./workers/pendingTimeoutWorker.js"; // Auto-cancel unanswered AI pending appointments
 
 const PORT = process.env.PORT || 8080;
 
@@ -56,6 +57,7 @@ const twilioWss = new WebSocketServer({ noServer: true });
 const dashboardWss = new WebSocketServer({ noServer: true });
 const whatsappWss = new WebSocketServer({ noServer: true });
 const agentEventsWss = new WebSocketServer({ noServer: true });
+const testCallInboxWss = new WebSocketServer({ noServer: true });
 
 // Store for dashboard monitoring connections
 const dashboardClients = new Set<WebSocket>();
@@ -172,6 +174,18 @@ app.post("/send-whatsapp", async (req: Request, res: Response) => {
 	}
 });
 
+// Twilio statusCallback for outbound callbacks: WhatsApp if the patient never answered
+app.post("/twilio/callback-status", (req: Request, res: Response) => {
+	const id = typeof req.query.id === "string" ? req.query.id : "";
+	const status =
+		typeof req.body?.CallStatus === "string" ? req.body.CallStatus : "";
+	res.sendStatus(204);
+	if (!id || !status) return;
+	handleCallbackStatus(id, status).catch((err) =>
+		logger.error({ err }, "🔥 Callback status handling failed"),
+	);
+});
+
 // Twilio webhook: returns TwiML to connect the call to a media stream
 app.all("/incoming-call", (req: Request, res: Response) => {
 	// Host for wss://…/media-stream must reach THIS realtime server (ngrok/tunnel), not Next.js.
@@ -195,13 +209,22 @@ app.all("/incoming-call", (req: Request, res: Response) => {
 	const direction = pickStr("Direction");
 	const callSid = pickStr("CallSid");
 
+	// Outbound callback placed by the pending-timeout worker: the patient is the
+	// callee (`To`), and the AI opens the conversation instead of answering.
+	const isCallback = req.query.mode === "callback";
+	const callbackReason = req.query.reason === "timeout" ? "timeout" : "refused";
+	const patientPhone = isCallback ? to : from;
+
 	const callerParameter =
-		from.length > 0
-			? `\n    <Parameter name="callerPhone" value="${escapeXmlAttr(from)}" />`
+		patientPhone.length > 0
+			? `\n    <Parameter name="callerPhone" value="${escapeXmlAttr(patientPhone)}" />`
 			: "";
+	const callbackParameters = isCallback
+		? `\n    <Parameter name="callMode" value="callback" />\n    <Parameter name="callbackReason" value="${callbackReason}" />`
+		: "";
 
 	logger.info(
-		{ host, hasCallerPhone: from.length > 0, callSid },
+		{ host, hasCallerPhone: patientPhone.length > 0, callSid, isCallback },
 		"📞 Incoming call webhook",
 	);
 
@@ -212,22 +235,23 @@ app.all("/incoming-call", (req: Request, res: Response) => {
 			logger.error({ err }, "🔥 Failed to create call row"),
 		);
 	}
-	if (from) {
-		ensurePersonRow(from).catch((err) =>
+	if (patientPhone) {
+		ensurePersonRow(patientPhone).catch((err) =>
 			logger.error({ err }, "🔥 Failed to upsert person"),
 		);
 	}
 
 	// CALL_ROUTER=livekit hands the call to the LiveKit agent over SIP;
 	// anything else keeps the media-stream session (Gemini Live etc.).
+	// Callbacks always use the media-stream session (it has the callback prompt).
 	const useLivekit =
-		process.env.CALL_ROUTER?.trim().toLowerCase() === "livekit";
+		!isCallback && process.env.CALL_ROUTER?.trim().toLowerCase() === "livekit";
 	const twiml = useLivekit
 		? livekitDialTwiml({ to, callSid })
 		: `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="wss://${host}/media-stream">${callerParameter}
+    <Stream url="wss://${host}/media-stream">${callerParameter}${callbackParameters}
     </Stream>
   </Connect>
 </Response>`;
@@ -282,6 +306,10 @@ server.on("upgrade", (request, socket, head) => {
 		whatsappWss.handleUpgrade(request, socket, head, (ws) => {
 			whatsappWss.emit("connection", ws, request);
 		});
+	} else if (pathname === "/test-call-inbox") {
+		testCallInboxWss.handleUpgrade(request, socket, head, (ws) => {
+			testCallInboxWss.emit("connection", ws, request);
+		});
 	} else if (pathname === "/agent-events") {
 		if (!hasInternalSecret(request.headers["x-internal-secret"])) {
 			socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
@@ -315,6 +343,26 @@ twilioWss.on("connection", (ws: WebSocket, request: http.IncomingMessage) => {
 		"http://localhost",
 	).searchParams.get("cs");
 	new TwilioSession(ws, logger, systemMessage, dashboardClients, settingsSid);
+});
+
+// ==================== Test-call Inbox ====================
+// URL: ws://<host>/test-call-inbox?phone=<phone>
+// The /test-call page listens here so callbacks ring the page, not Twilio.
+
+testCallInboxWss.on("connection", (ws: WebSocket, request) => {
+	const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
+	const phone = url.searchParams.get("phone")?.trim() ?? "";
+	if (!phone) {
+		ws.close();
+		return;
+	}
+	const unregister = registerTestCallInbox(phone, ws);
+	logger.info({ phone }, "☎️ Test-call inbox connected");
+	ws.on("close", unregister);
+	ws.on("error", (error) => {
+		logger.error({ error }, "🔥 Test-call inbox WebSocket error");
+		unregister();
+	});
 });
 
 // ==================== LiveKit Agent Event Relay ====================
