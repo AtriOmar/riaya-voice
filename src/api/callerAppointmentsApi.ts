@@ -58,3 +58,49 @@ export async function cancelCallerAiAppointment(
 	);
 	return data;
 }
+
+export type RefusalSuggestion = {
+	doctorId: number;
+	name: string;
+	cabinetName: string | null;
+	address: string | null;
+	distanceKm: number;
+	slotStart: string;
+	slotEnd: string;
+};
+
+export type CallerRefusalContext = {
+	refusedDoctorName: string | null;
+	suggestions: RefusalSuggestion[];
+};
+
+/**
+ * Other doctors to offer when a doctor recently refused this caller's request.
+ * Never throws: a failure just means the call runs without the extra context.
+ */
+export async function getCallerRefusalContext(
+	callerPhone: string,
+): Promise<CallerRefusalContext | null> {
+	try {
+		const { data } = await nextjsApi.post<{
+			found: boolean;
+			refusedDoctorName: string | null;
+			suggestions: RefusalSuggestion[];
+		}>(
+			"/api/internal/caller/refusal-context",
+			{ phoneNumber: callerPhone.trim() },
+			{ headers: internalHeaders(), timeout: 3000 },
+		);
+		if (!data.found || data.suggestions.length === 0) return null;
+		return {
+			refusedDoctorName: data.refusedDoctorName,
+			suggestions: data.suggestions,
+		};
+	} catch (err) {
+		console.error(
+			"[callerAppointmentsApi] getCallerRefusalContext failed",
+			err,
+		);
+		return null;
+	}
+}

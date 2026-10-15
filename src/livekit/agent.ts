@@ -15,6 +15,10 @@ import * as openai from "@livekit/agents-plugin-openai";
 import * as silero from "@livekit/agents-plugin-silero";
 import { ParticipantKind } from "@livekit/rtc-node";
 import { pino } from "pino";
+import {
+	type CallerRefusalContext,
+	getCallerRefusalContext,
+} from "../api/callerAppointmentsApi.js";
 import { createCallEvent, ensureCallRow, updateCall } from "../api/callsApi.js";
 import { ensurePersonRow } from "../api/personsApi.js";
 import { CITIES } from "../constants/cities.js";
@@ -424,9 +428,14 @@ export default defineAgent({
 			firstName = row.firstName?.trim() || null;
 			language = normalizeCallLanguage(row.preferredLanguage);
 		};
+		let refusalContext: CallerRefusalContext | null = null;
 		if (callerPhone) {
-			const row = await ensurePersonRow(callerPhone);
+			const [row, refusal] = await Promise.all([
+				ensurePersonRow(callerPhone),
+				getCallerRefusalContext(callerPhone),
+			]);
 			if (row) applyPersonRow(row);
+			refusalContext = refusal;
 		}
 
 		const instructions = () =>
@@ -434,6 +443,7 @@ export default defineAgent({
 				language,
 				firstName,
 				callerPhone,
+				refusalContext,
 			}) + (PROFILE_CAPTURE === "background" ? PROFILE_CAPTURE_NOTE : "");
 
 		// ---------- pipeline ----------

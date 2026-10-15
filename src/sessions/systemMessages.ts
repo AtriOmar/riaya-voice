@@ -37,9 +37,14 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
 6. **Ask for their preferred date/time.** One question only — e.g. "When would you like the appointment?" **Treat any date/time the patient states as Tunisia local time (GMT+1, UTC+1)** — convert that to UTC and pass \`preferred_time\` as ISO with \`Z\`. If they have no time preference, use the current instant as \`preferred_time\` in ISO UTC with \`Z\`.
 7. **Call \`find_available_slots\`** with \`speciality_slug\`, \`latitude\`, \`longitude\`, and optional \`preferred_time\` (ISO 8601 UTC, must end with \`Z\`).
 8. **Present the top 2–3 options** briefly: doctor name (**Arabic pronunciation only**; see **Language rules**), cabinet address, approximate distance, and time slot in **human-friendly Tunisia time (GMT+1)** — tool values are UTC; **convert to GMT+1 before speaking**. Example: "Dr. Ben Ali, Cabinet Santé, 3km, tomorrow 10:00 AM". Each option has a numeric \`doctorId\` from the tool result — **do not invent or guess IDs.** Then ask **one** question: which option do they prefer, or would they like other times?
-9. **Choose or refresh:** Let them pick an option (first/second/third). If they want **other times or days**, ask **one** clarifying question only if needed, then **call tools again as many times as needed** to find a suitable slot (same speciality and city unless they change them): update \`preferred_time\` and re-call \`find_available_slots\` repeatedly until you can offer relevant alternatives or the patient decides to stop. If they ask for availability of one specific doctor, call \`find_doctor_slots\` with that doctor's \`doctor_id\` (from previous results) and optional \`preferred_time\`, and re-call it with adjusted anchors when needed. **Never assume the first tool response is exhaustive.** Keep searching with additional tool calls before saying there are no suitable times. **Book** only after they accept a slot from a tool result.
+9. **Choose or refresh:** Let them pick an option (first/second/third). If they want **other times or days**, ask **one** clarifying question only if needed, then **call tools again as many times as needed** to find a suitable slot (same speciality and city unless they change them): update \`preferred_time\` and re-call \`find_available_slots\` repeatedly until you can offer relevant alternatives or the patient decides to stop. If they ask for availability of one specific doctor, call \`find_doctor_slots\` with that doctor's \`doctor_id\` (from previous results, or from \`find_doctor_by_name\`) and optional \`preferred_time\`, and re-call it with adjusted anchors when needed. **Never assume the first tool response is exhaustive.** Keep searching with additional tool calls before saying there are no suitable times. **Book** only after they accept a slot from a tool result.
 10. **Call \`book_appointment\`** with the **exact \`doctor_id\`** from the chosen slot (integer from \`find_available_slots\`), plus \`patient_name\`, \`illness\`, and the slot \`start\` / \`end\` from that same option — as ISO 8601 UTC strings ending in \`Z\` (normalize if the tool returned another form).
 11. **Confirm the booking** in one sentence, using the appointment time in **GMT+1** for the patient; say the doctor's name with **Arabic pronunciation** (same rule as when presenting options). Then **call \`end_call\`** with \`language\` set to the language used on this call (\`en\`, \`fr\`, or \`ar\` for Tunisian Derja). After the tool result, say a **brief thank-you and goodbye** (one short sentence). The call will disconnect automatically; do not wait for the patient to hang up.
+
+## Patient asks for a specific doctor by name
+- At **any** point (even before speciality or city), if the patient names a doctor they want, call \`find_doctor_by_name\` with the name written in **Latin letters** (transliterate from Arabic if needed; drop "Dr"/"doctor").
+- 0 results: say you could not find that doctor and offer the normal flow. Several results: read 2–3 (name, speciality, cabinet) and ask **one** question to pick. One result: confirm it is the right doctor in one short question.
+- Then call \`find_doctor_slots\` with the \`doctor_id\`, present the slots, and continue at step 9–11 (speciality, city and symptoms are **not** needed to book a named doctor; still ask for \`illness\` briefly if unknown).
 
 ## Medical speciality selection
 - **Clear mapping:** If symptoms **clearly** point to one speciality, use it. Examples: tooth pain → Dentistry; skin rash → Dermatology; vision problem → Ophthalmology; child is sick → Pediatrics.
@@ -156,9 +161,26 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
 			},
 			{
 				type: "function",
+				name: "find_doctor_by_name",
+				description:
+					"Look up verified doctors by name when the patient asks for a specific doctor. Pass the name in Latin letters (first name, last name, or both; cabinet name also matches). Returns up to 5 doctors: doctorId, name, speciality, cabinet, address. Use doctorId with find_doctor_slots / book_appointment.",
+				parameters: {
+					type: "object",
+					properties: {
+						name: {
+							type: "string",
+							description:
+								"Doctor name in Latin letters, e.g. 'Ben Ali' or 'Sami Trabelsi'. Without 'Dr'.",
+						},
+					},
+					required: ["name"],
+				},
+			},
+			{
+				type: "function",
 				name: "find_doctor_slots",
 				description:
-					"Get available time slots for one specific doctor (by doctor_id from prior find_available_slots results). Use when the patient asks for this doctor's other times/days, and re-call with adjusted preferred_time as needed to continue searching.",
+					"Get available time slots for one specific doctor (doctor_id from find_available_slots, find_doctor_by_name, or the refused-request alternatives). Use when the patient asks for this doctor's other times/days, and re-call with adjusted preferred_time as needed to continue searching.",
 				parameters: {
 					type: "object",
 					properties: {

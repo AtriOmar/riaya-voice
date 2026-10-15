@@ -1,5 +1,7 @@
 /** Prompt text shared by every call path (Twilio media stream, LiveKit agent). */
 
+import type { CallerRefusalContext } from "../api/callerAppointmentsApi.js";
+
 export type CallLanguage = "en" | "fr" | "ar";
 
 export const LANGUAGE_LABEL: Record<CallLanguage, string> = {
@@ -29,6 +31,52 @@ export function buildInitialGreetingInstructions(
 		: 'Say exactly one short sentence: "Hello, this is Riaya. How can I help you?" Do NOT call any functions.';
 }
 
+/** Why Riaya is calling the patient back. */
+export type CallbackReason = "refused" | "timeout";
+
+export function normalizeCallbackReason(raw: unknown): CallbackReason {
+	return raw === "timeout" ? "timeout" : "refused";
+}
+
+/**
+ * Opening line when Riaya placed the call. Short on purpose: one or two
+ * sentences, one question. The detailed options come later in the conversation.
+ */
+export function buildCallbackGreetingInstructions(params: {
+	lang: CallLanguage;
+	firstName?: string | null;
+	reason: CallbackReason;
+	refusedDoctorName?: string | null;
+}): string {
+	const name = params.firstName?.trim();
+	const what =
+		params.reason === "refused"
+			? params.refusedDoctorName
+				? `Dr. ${params.refusedDoctorName} could not accept their appointment request`
+				: "the doctor could not accept their appointment request"
+			: "no doctor was able to confirm their appointment request in time";
+	return `You placed this call. The patient just picked up. Speak in ${LANGUAGE_LABEL[params.lang]}.
+Say at most two short sentences: ${name ? `greet ${name} by first name, ` : "greet them, "}say you are Riaya calling about their appointment request, and tell them ${what}.
+Then ask ONE question: would they like you to find another doctor for them? Stop and wait for the answer.
+Do NOT list doctors or times yet. Do NOT call any functions. Never read out a phone number.`;
+}
+
+function buildCallbackBlock(reason: CallbackReason): string {
+	const why =
+		reason === "refused"
+			? "the doctor refused their appointment request"
+			: "no doctor confirmed their appointment request in time, so it was cancelled";
+	return `
+
+## OUTBOUND CALLBACK (YOU CALLED THE PATIENT)
+You, Riaya, placed this call because ${why}. The patient already has no appointment for that request.
+- You already explained this in your opening line. Do not repeat it, and do not ask for their phone number.
+- If they want another doctor, help them book one using the normal flow. Offer at most two options at a time and ask one question per turn.
+- If they say it is a wrong number or they are not the patient, apologize briefly and call \`end_call\`.
+- If they decline or are no longer interested, thank them and call \`end_call\`.
+- If they ask something unrelated, answer briefly or help with a booking as usual.`;
+}
+
 export function normalizeCallLanguage(raw: unknown): CallLanguage {
 	if (raw === "en" || raw === "fr" || raw === "ar") return raw;
 	return "ar";
@@ -38,7 +86,36 @@ export type CallerProfile = {
 	language: CallLanguage;
 	firstName?: string | null;
 	callerPhone?: string | null;
+	/** Set when a doctor recently refused this caller's request. */
+	refusalContext?: CallerRefusalContext | null;
+	/** Set when Riaya placed the call (outbound callback). */
+	callbackReason?: CallbackReason | null;
 };
+
+function buildRefusalBlock(
+	context: CallerRefusalContext,
+	isCallback: boolean,
+): string {
+	const doctors = context.suggestions
+		.map(
+			(s, i) =>
+				`${i + 1}. doctor_id **${s.doctorId}** — ${s.name}${s.cabinetName ? `, ${s.cabinetName}` : ""}${s.address ? `, ${s.address}` : ""} (~${s.distanceKm} km); first slot start \`${s.slotStart}\`, end \`${s.slotEnd}\``,
+		)
+		.join("\n");
+	const refused = context.refusedDoctorName
+		? `Dr. ${context.refusedDoctorName}`
+		: "the doctor";
+	return `
+
+## RECENT REFUSED REQUEST (THIS CALLER)
+A doctor recently **refused** this caller's appointment request (${refused}). ${isCallback ? "You are calling them about it." : "The caller was told to call back and may be calling about it."}
+${isCallback ? "You already told them in the opening line. When they agree to another doctor, offer these alternatives (same speciality, near the same area), at most two at a time, one question only:" : `Do **not** mention this in the opening greeting. When the patient says they want an appointment, or asks what happened, say briefly that ${refused} could not accept the request, then offer these alternatives (same speciality, near the same area) — present them like normal options, one question only:`}
+${doctors}
+- Times are UTC; say them in GMT+1. Names: Arabic pronunciation (see language rules).
+- If the patient picks one, call \`book_appointment\` with that exact \`doctor_id\` and the listed slot \`start\` / \`end\` (you may first call \`find_doctor_slots\` if they want another time).
+- If they want a different speciality, location, or a specific doctor by name, follow the normal flow / \`find_doctor_by_name\`.
+- Never invent doctors or times beyond this list and tool results.`;
+}
 
 /** Full session instructions: base system prompt + caller profile / language / phone blocks. */
 export function buildCallInstructions(
@@ -61,10 +138,16 @@ Do **not** mention existing appointments in the opening greeting. Use \`list_my_
 Stored preference for this caller: **${lang}** (${langLabel}). **Start and respond in this language** until the patient asks to switch.
 If they ask to speak a language **different from ${lang}** (English, French, or Tunisian Derja), switch immediately and call \`update_person_info\` with \`preferred_language\` set to \`en\`, \`fr\`, or \`ar\` (use \`ar\` for Tunisian Derja). Mixing a few French or English words into Derja is normal and is **not** a language switch; do not call the tool for it.`;
 
-	if (!profile.callerPhone) return instructions;
-	return `${instructions}
+	const callback = profile.callbackReason
+		? buildCallbackBlock(profile.callbackReason)
+		: "";
+	if (!profile.callerPhone) return `${instructions}${callback}`;
+	const withPhone = `${instructions}${callback}
 
 ## CALLER PHONE (THIS LINE)
 The phone number for this call is: **${profile.callerPhone}**.
 The server uses this number automatically when \`book_appointment\`, \`list_my_ai_appointments\`, or \`cancel_appointment\` runs. Do **not** ask the patient about their phone number.`;
+	return profile.refusalContext
+		? `${withPhone}${buildRefusalBlock(profile.refusalContext, Boolean(profile.callbackReason))}`
+		: withPhone;
 }

@@ -431,6 +431,20 @@ export class CallTools {
 				result = await this.findAvailableSlots(slotArgs);
 				break;
 			}
+			case "find_doctor_by_name": {
+				const nameArgs = parsedArgs as { name?: unknown };
+				const doctorName =
+					typeof nameArgs?.name === "string" ? nameArgs.name.trim() : "";
+				if (doctorName.length < 2) {
+					result = JSON.stringify({
+						error: true,
+						message: "find_doctor_by_name: invalid arguments (expected name)",
+					});
+					break;
+				}
+				result = await this.findDoctorByName(doctorName);
+				break;
+			}
 			case "find_doctor_slots": {
 				const doctorSlotArgs = normalizeFindDoctorSlotsArgs(parsedArgs);
 				if (!doctorSlotArgs) {
@@ -700,6 +714,38 @@ export class CallTools {
 		);
 
 		return JSON.stringify({ found: true, doctors: top });
+	}
+
+	private async findDoctorByName(name: string): Promise<string> {
+		const { data } = await nextjsApi.get<{
+			doctors: {
+				id: number;
+				firstName: string | null;
+				lastName: string | null;
+				cabinetName: string | null;
+				address: string | null;
+				specialitySlug: string | null;
+				speciality: string | null;
+			}[];
+		}>("/api/doctors/search", { params: { name, limit: 5 } });
+
+		if (data.doctors.length === 0) {
+			return JSON.stringify({
+				found: false,
+				message: "No verified doctor matches that name.",
+			});
+		}
+		return JSON.stringify({
+			found: true,
+			doctors: data.doctors.map((d) => ({
+				doctorId: d.id,
+				name: `Dr. ${[d.firstName, d.lastName].filter(Boolean).join(" ")}`,
+				speciality: d.speciality,
+				specialitySlug: d.specialitySlug,
+				cabinet: d.cabinetName,
+				address: d.address,
+			})),
+		});
 	}
 
 	private async findDoctorSlots(params: {
