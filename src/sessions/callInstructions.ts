@@ -72,7 +72,7 @@ function buildCallbackBlock(reason: CallbackReason): string {
 You, Riaya, placed this call because ${why}. The patient already has no appointment for that request.
 - You already explained this in your opening line. Do not repeat it, and do not ask for their phone number.
 - If they want another doctor, help them book one using the normal flow. Offer at most two options at a time and ask one question per turn.
-- If they say it is a wrong number or they are not the patient, apologize briefly and call \`end_call\`.
+- If it is a wrong number (they never asked for an appointment), apologize briefly and call \`end_call\`. The caller may have booked for someone else (a child, a parent); that is not a wrong number.
 - If they decline or are no longer interested, thank them and call \`end_call\`.
 - If they ask something unrelated, answer briefly or help with a booking as usual.`;
 }
@@ -117,6 +117,25 @@ ${doctors}
 - Never invent doctors or times beyond this list and tool results.`;
 }
 
+/** Tunisia has no daylight saving time, so local time is always UTC+1. */
+function buildCurrentTimeBlock(now: Date = new Date()): string {
+	const local = new Intl.DateTimeFormat("en-GB", {
+		timeZone: "Africa/Tunis",
+		weekday: "long",
+		day: "numeric",
+		month: "long",
+		year: "numeric",
+		hour: "2-digit",
+		minute: "2-digit",
+		hour12: false,
+	}).format(now);
+	return `
+
+## CURRENT DATE AND TIME
+Now in Tunisia (GMT+1): **${local}**. In UTC: \`${now.toISOString()}\`.
+Use this for "today", "tomorrow", weekdays, and as \`preferred_time\` when the patient has no preference.`;
+}
+
 /** Full session instructions: base system prompt + caller profile / language / phone blocks. */
 export function buildCallInstructions(
 	systemPrompt: string,
@@ -128,7 +147,7 @@ export function buildCallInstructions(
 	const profileBlock = knownName
 		? `Known first name: **${knownName}** (use in greeting; you may skip asking for name unless unclear).`
 		: "Name not on file yet — ask for their name early in the booking flow.";
-	const instructions = `${systemPrompt}
+	const instructions = `${systemPrompt}${buildCurrentTimeBlock()}
 
 ## CALLER PROFILE
 ${profileBlock}

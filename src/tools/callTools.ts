@@ -48,6 +48,17 @@ export interface CallToolsContext {
 
 const CITY_SEARCH_RADIUS_M = 30_000;
 
+/** Row from `GET /api/internal/places/search` (see web `lib/geo`). */
+type PlaceSearchResult = {
+	id: string;
+	label: string;
+	lat: number | null;
+	lng: number | null;
+	city: string | null;
+	state: string | null;
+	street: string | null;
+};
+
 function normalizeCityName(raw: string): string {
 	return raw
 		.normalize("NFD")
@@ -561,50 +572,45 @@ export class CallTools {
 	}
 
 	private async searchLocation(city: string, query: string): Promise<string> {
-		const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY;
-		if (!GEOAPIFY_API_KEY) {
-			this.ctx.logger.error("GEOAPIFY_API_KEY is not set");
-			return JSON.stringify({
-				error: true,
-				message: "Geocoding API key not configured.",
-			});
-		}
 		try {
 			const cityMatch = findCityByName(city);
-			const baseParams = {
-				text: `${query}, ${city}`,
-				limit: 5,
-				apiKey: GEOAPIFY_API_KEY,
-			};
-			const search = async (filter: string, bias?: string) =>
+			// The Next app picks the provider (GEO_PROVIDER); we only ask for places.
+			const search = async (
+				near?: { lat: number; lng: number },
+				radiusM?: number,
+			) =>
 				(
-					await axios.get("https://api.geoapify.com/v1/geocode/search", {
-						params: { ...baseParams, filter, ...(bias ? { bias } : {}) },
-					})
+					await nextjsApi.get<PlaceSearchResult[]>(
+						"/api/internal/places/search",
+						{
+							params: {
+								text: `${query}, ${city}`,
+								...(near ? { lat: near.lat, lng: near.lng } : {}),
+								...(radiusM ? { radiusM } : {}),
+							},
+							headers: {
+								"x-internal-secret": process.env.INTERNAL_API_SECRET || "",
+							},
+						},
+					)
 				).data;
 
-			let data: { features?: unknown[] };
+			let places: PlaceSearchResult[];
 			if (cityMatch) {
-				const { longitude, latitude } = cityMatch;
-				data = await search(
-					`circle:${longitude},${latitude},${CITY_SEARCH_RADIUS_M}`,
-					`proximity:${longitude},${latitude}`,
-				);
-				if (!data.features?.length) {
+				const near = { lat: cityMatch.latitude, lng: cityMatch.longitude };
+				places = await search(near, CITY_SEARCH_RADIUS_M);
+				if (places.length === 0) {
 					this.ctx.logger.info(
 						{ city: cityMatch.slug },
 						"Geocoding: no results inside city radius, retrying country-wide",
 					);
-					data = await search(
-						"countrycode:tn",
-						`proximity:${longitude},${latitude}`,
-					);
+					places = await search(near);
 				}
 			} else {
-				data = await search("countrycode:tn");
+				places = await search();
 			}
-			const features = data.features || [];
-			if (features.length === 0) {
+
+			if (places.length === 0) {
 				return JSON.stringify({
 					found: false,
 					message:
@@ -612,14 +618,13 @@ export class CallTools {
 				});
 			}
 
-			// biome-ignore lint/suspicious/noExplicitAny: geoapify structure
-			const results = features.map((f: any) => ({
-				name: f.properties.formatted,
-				city: f.properties.city,
-				state: f.properties.state,
-				street: f.properties.street,
-				latitude: f.properties.lat,
-				longitude: f.properties.lon,
+			const results = places.map((p) => ({
+				name: p.label,
+				city: p.city,
+				state: p.state,
+				street: p.street,
+				latitude: p.lat,
+				longitude: p.lng,
 			}));
 
 			return JSON.stringify({
@@ -689,7 +694,9 @@ export class CallTools {
 			name: `Dr. ${doc.firstName} ${doc.lastName}`,
 			cabinet: doc.cabinetName,
 			address: doc.address ?? null,
-			distanceKm: Math.round(doc.distance * 10) / 10,
+			distanceKm: Math.round((doc.roadDistanceKm ?? doc.distance) * 10) / 10,
+			// Far fallback: tell the patient the doctor is outside the usual area.
+			...(doc.outsideRadius ? { farAway: true } : {}),
 			slotStart: doc.nextSlot.start,
 			slotEnd: doc.nextSlot.end,
 			// Additional nearby slots so the AI can offer alternatives without

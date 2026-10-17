@@ -145,6 +145,11 @@ export type BestFitDoctor = {
 	createdAt: string;
 	updatedAt: string;
 	distance: number;
+	/** True when beyond the search radius (returned as a fallback). */
+	outsideRadius?: boolean;
+	/** Road distance / drive time when routing succeeded. */
+	roadDistanceKm?: number;
+	driveMinutes?: number;
 	nextSlot: { start: string; end: string };
 	/** Additional forward slots near desiredTime for same-call alternatives. */
 	nearbySlots?: { start: string; end: string }[];
