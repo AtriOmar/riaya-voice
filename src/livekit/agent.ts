@@ -810,11 +810,12 @@ export default defineAgent({
 						signal: profileAbort.signal,
 					});
 					const args: Record<string, string> = {};
-					if (found.first_name && found.first_name !== firstName) {
+					// This saves the phone owner's profile. Only fill a missing name,
+					// never replace one: a different name usually means someone else
+					// is calling from the owner's phone (e.g. a spouse).
+					if (found.first_name && !firstName && !capturedName.first) {
 						args.first_name = found.first_name;
 						if (found.last_name) args.last_name = found.last_name;
-					} else if (found.last_name && !capturedName.first) {
-						args.last_name = found.last_name;
 					}
 					if (
 						found.preferred_language &&
