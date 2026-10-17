@@ -19,6 +19,11 @@ import {
 	type CallerRefusalContext,
 	getCallerRefusalContext,
 } from "../api/callerAppointmentsApi.js";
+import {
+	getPeopleOnLine,
+	ownerOnly,
+	type PersonOnLine,
+} from "../api/callerPeopleApi.js";
 import { createCallEvent, ensureCallRow, updateCall } from "../api/callsApi.js";
 import { ensurePersonRow } from "../api/personsApi.js";
 import { CITIES } from "../constants/cities.js";
@@ -429,13 +434,16 @@ export default defineAgent({
 			language = normalizeCallLanguage(row.preferredLanguage);
 		};
 		let refusalContext: CallerRefusalContext | null = null;
+		let people: PersonOnLine[] = [];
 		if (callerPhone) {
-			const [row, refusal] = await Promise.all([
+			const [row, refusal, onLine] = await Promise.all([
 				ensurePersonRow(callerPhone),
 				getCallerRefusalContext(callerPhone),
+				getPeopleOnLine(callerPhone),
 			]);
 			if (row) applyPersonRow(row);
 			refusalContext = refusal;
+			people = onLine.length > 0 ? onLine : row ? ownerOnly(row) : [];
 		}
 
 		const instructions = () =>
@@ -443,6 +451,7 @@ export default defineAgent({
 				language,
 				firstName,
 				callerPhone,
+				people,
 				refusalContext,
 			}) + (PROFILE_CAPTURE === "background" ? PROFILE_CAPTURE_NOTE : "");
 

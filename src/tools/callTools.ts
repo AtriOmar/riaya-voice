@@ -4,6 +4,7 @@ import {
 	cancelCallerAiAppointment,
 	listCallerAiAppointments,
 } from "../api/callerAppointmentsApi.js";
+import type { PersonRelationship } from "../api/callerPeopleApi.js";
 import type { createCallEvent, updateCall } from "../api/callsApi.js";
 import { nextjsApi } from "../api/nextjsApiClient.js";
 import { ensurePersonRow, updatePersonRow } from "../api/personsApi.js";
@@ -159,9 +160,17 @@ type FindDoctorSlotsArgs = {
 	limit?: number;
 };
 
+/** Who a booking is for: someone on the line (`personId`) or a new family member. */
+type BookingPatient = {
+	personId?: number;
+	firstName: string;
+	lastName?: string;
+	relationship?: Exclude<PersonRelationship, "self">;
+};
+
 type BookAppointmentToolArgs = {
 	doctorId: number | string;
-	patientName: string;
+	patient: BookingPatient;
 	illness: string;
 	start: string;
 	end: string;
@@ -171,9 +180,54 @@ type BookEmergencyAppointmentsToolArgs = {
 	specialitySlug: string;
 	latitude: number;
 	longitude: number;
-	patientName: string;
+	patient: BookingPatient;
 	illness: string;
 };
+
+const FAMILY_RELATIONSHIPS = [
+	"child",
+	"parent",
+	"spouse",
+	"sibling",
+	"other",
+] as const satisfies readonly Exclude<PersonRelationship, "self">[];
+
+/** Full name for logs and dashboard events. */
+function bookingPatientName(p: BookingPatient): string {
+	return [p.firstName, p.lastName].filter(Boolean).join(" ");
+}
+
+/**
+ * Read the `patient_*` tool arguments. Needs a first name, plus either
+ * `patient_person_id` (someone on the line) or `patient_relationship` (new family member).
+ */
+function parseBookingPatient(
+	o: Record<string, unknown>,
+): BookingPatient | null {
+	const firstName = strField(o, "patient_first_name", "patientFirstName");
+	if (firstName === undefined) return null;
+	const lastName = strField(o, "patient_last_name", "patientLastName");
+
+	const rawId = o.patient_person_id ?? o.patientPersonId;
+	const personId = Number(rawId);
+	if (
+		rawId != null &&
+		rawId !== "" &&
+		Number.isInteger(personId) &&
+		personId > 0
+	) {
+		return { personId, firstName, lastName };
+	}
+
+	const relationship = strField(
+		o,
+		"patient_relationship",
+		"patientRelationship",
+	);
+	const family = FAMILY_RELATIONSHIPS.find((r) => r === relationship);
+	if (!family) return null;
+	return { firstName, lastName, relationship: family };
+}
 
 function phoneDigitsOnly(raw: string): string {
 	return raw.replace(/\D/g, "");
@@ -285,12 +339,12 @@ function normalizeBookAppointmentArgs(
 		return null;
 	const o = raw as Record<string, unknown>;
 	const doctorId = o.doctor_id ?? o.doctorId;
-	const patientName = strField(o, "patient_name", "patientName");
+	const patient = parseBookingPatient(o);
 	const illness = strField(o, "illness", "illness");
 	const start = strField(o, "start", "start");
 	const end = strField(o, "end", "end");
 	if (
-		patientName === undefined ||
+		patient === null ||
 		illness === undefined ||
 		start === undefined ||
 		end === undefined
@@ -299,7 +353,7 @@ function normalizeBookAppointmentArgs(
 	}
 	return {
 		doctorId: doctorId as number | string,
-		patientName,
+		patient,
 		illness,
 		start,
 		end,
@@ -315,18 +369,18 @@ function normalizeBookEmergencyAppointmentsArgs(
 	const specialitySlug = strField(o, "speciality_slug", "specialitySlug");
 	const latitude = numField(o, "latitude", "latitude");
 	const longitude = numField(o, "longitude", "longitude");
-	const patientName = strField(o, "patient_name", "patientName");
+	const patient = parseBookingPatient(o);
 	const illness = strField(o, "illness", "illness");
 	if (
 		specialitySlug === undefined ||
 		latitude === undefined ||
 		longitude === undefined ||
-		patientName === undefined ||
+		patient === null ||
 		illness === undefined
 	) {
 		return null;
 	}
-	return { specialitySlug, latitude, longitude, patientName, illness };
+	return { specialitySlug, latitude, longitude, patient, illness };
 }
 
 /** Accepts snake_case (tool schema) or legacy camelCase; maps to internal shape for HTTP. */
@@ -587,9 +641,6 @@ export class CallTools {
 								text: `${query}, ${city}`,
 								...(near ? { lat: near.lat, lng: near.lng } : {}),
 								...(radiusM ? { radiusM } : {}),
-							},
-							headers: {
-								"x-internal-secret": process.env.INTERNAL_API_SECRET || "",
 							},
 						},
 					)
@@ -899,6 +950,13 @@ export class CallTools {
 		}
 	}
 
+	/** Name the call after the caller only when the booking is for the caller themselves. */
+	private callerNameIfSelf(patient: BookingPatient): { callerName?: string } {
+		return patient.personId != null && patient.personId === this.ctx.personId
+			? { callerName: bookingPatientName(patient) }
+			: {};
+	}
+
 	private async bookAppointment(
 		params: BookAppointmentToolArgs,
 	): Promise<string> {
@@ -924,13 +982,13 @@ export class CallTools {
 			);
 			throw new Error(msg);
 		}
-		const phoneNumber = phoneDigitsOnly(callerRaw);
-		if (phoneNumber.length < 8) {
-			const msg = `book_appointment: caller phone too short after normalization (${phoneNumber.length} digits)`;
+		const callerDigits = phoneDigitsOnly(callerRaw);
+		if (callerDigits.length < 8) {
+			const msg = `book_appointment: caller phone too short after normalization (${callerDigits.length} digits)`;
 			console.log(
 				"---------------------- book_appointment VALIDATION ERROR ----------------------",
 			);
-			console.log("callerPhone:", callerRaw, "digits:", phoneNumber);
+			console.log("callerPhone:", callerRaw, "digits:", callerDigits);
 			console.log(
 				"-------------------------------------------------------------",
 			);
@@ -957,8 +1015,8 @@ export class CallTools {
 
 		const body: BookAppointmentParams = {
 			doctorId,
-			name: params.patientName,
-			phoneNumber,
+			phoneNumber: callerRaw,
+			patient: params.patient,
 			illness: params.illness,
 			start: params.start,
 			end: params.end,
@@ -993,7 +1051,7 @@ export class CallTools {
 			this.ctx.emit({
 				type: "appointment_booked",
 				callSid: this.ctx.callSid,
-				data,
+				data: { ...data, patientName: bookingPatientName(params.patient) },
 			});
 			this.ctx.persistEvent({
 				type: "appointment_booked",
@@ -1002,13 +1060,14 @@ export class CallTools {
 			});
 			this.ctx.persistCallUpdate({
 				appointmentId: appointmentId ?? null,
-				callerName: params.patientName,
+				...this.callerNameIfSelf(params.patient),
 			});
 		}
 
 		return JSON.stringify({
 			success: true,
 			appointment_id: appointmentId,
+			patient_person_id: row?.personId,
 			status: row?.status,
 			message: "Appointment created successfully with pending status.",
 		});
@@ -1035,11 +1094,11 @@ export class CallTools {
 			});
 		}
 
-		const phoneNumber = phoneDigitsOnly(callerRaw);
-		if (phoneNumber.length < 8) {
+		const callerDigits = phoneDigitsOnly(callerRaw);
+		if (callerDigits.length < 8) {
 			return JSON.stringify({
 				error: true,
-				message: `book_emergency_appointments: caller phone too short after normalization (${phoneNumber.length} digits)`,
+				message: `book_emergency_appointments: caller phone too short after normalization (${callerDigits.length} digits)`,
 			});
 		}
 
@@ -1047,8 +1106,8 @@ export class CallTools {
 			speciality: params.specialitySlug,
 			lat: params.latitude,
 			long: params.longitude,
-			name: params.patientName,
-			phoneNumber,
+			phoneNumber: callerRaw,
+			patient: params.patient,
 			illness: params.illness,
 		};
 
@@ -1065,7 +1124,11 @@ export class CallTools {
 		const { data } = await nextjsApi.post<{
 			found: boolean;
 			emergencyGroupId?: string;
-			appointments?: Array<{ id?: number; doctorId?: number }>;
+			appointments?: Array<{
+				id?: number;
+				doctorId?: number;
+				personId?: number;
+			}>;
 			doctors?: Array<{
 				doctorId: number;
 				name: string;
@@ -1104,7 +1167,7 @@ export class CallTools {
 					data: {
 						...appt,
 						urgent: true,
-						newPatientName: params.patientName,
+						patientName: bookingPatientName(params.patient),
 					},
 				});
 			}
@@ -1115,7 +1178,7 @@ export class CallTools {
 			});
 			this.ctx.persistCallUpdate({
 				appointmentId: data.appointments[0]?.id ?? null,
-				callerName: params.patientName,
+				...this.callerNameIfSelf(params.patient),
 			});
 		}
 
@@ -1123,6 +1186,7 @@ export class CallTools {
 			success: true,
 			found: true,
 			emergency_group_id: data.emergencyGroupId,
+			patient_person_id: data.appointments[0]?.personId,
 			count: data.appointments.length,
 			doctors: data.doctors,
 			message:

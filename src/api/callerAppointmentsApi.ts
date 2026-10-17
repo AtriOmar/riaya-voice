@@ -1,14 +1,9 @@
 import { nextjsApi } from "./nextjsApiClient.js";
 
-const INTERNAL_API_SECRET = process.env.INTERNAL_API_SECRET || "";
-
-const internalHeaders = () => ({
-	"x-internal-secret": INTERNAL_API_SECRET,
-	"Content-Type": "application/json",
-});
-
 export type CallerAiAppointmentItem = {
 	appointmentId: number;
+	/** Who the appointment is for (the caller or a family member). */
+	patientName: string | null;
 	status: string | null;
 	start: string | null;
 	end: string | null;
@@ -35,7 +30,6 @@ export async function listCallerAiAppointments(
 			phoneNumber: callerPhone.trim(),
 			includeRecentPast: options?.includeRecentPast,
 		},
-		{ headers: internalHeaders() },
 	);
 	return data;
 }
@@ -48,14 +42,10 @@ export async function cancelCallerAiAppointment(
 		success: true;
 		appointmentId: number;
 		status: string | null;
-	}>(
-		"/api/internal/caller/ai-appointments/cancel",
-		{
-			phoneNumber: callerPhone.trim(),
-			appointmentId,
-		},
-		{ headers: internalHeaders() },
-	);
+	}>("/api/internal/caller/ai-appointments/cancel", {
+		phoneNumber: callerPhone.trim(),
+		appointmentId,
+	});
 	return data;
 }
 
@@ -89,7 +79,7 @@ export async function getCallerRefusalContext(
 		}>(
 			"/api/internal/caller/refusal-context",
 			{ phoneNumber: callerPhone.trim() },
-			{ headers: internalHeaders(), timeout: 3000 },
+			{ timeout: 3000 },
 		);
 		if (!data.found || data.suggestions.length === 0) return null;
 		return {

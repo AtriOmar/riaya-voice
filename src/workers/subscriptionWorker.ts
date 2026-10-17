@@ -32,11 +32,6 @@ export const subscriptionWorker = new Worker(
 			const response = await nextjsApi.post(
 				"/api/internal/subscriptions/process-expiring",
 				{},
-				{
-					headers: {
-						"x-internal-secret": process.env.INTERNAL_API_SECRET ?? "",
-					},
-				},
 			);
 
 			logger.info(

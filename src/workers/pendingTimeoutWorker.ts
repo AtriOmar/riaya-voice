@@ -179,11 +179,6 @@ export const pendingTimeoutWorker = new Worker(
 		const response = await nextjsApi.post(
 			"/api/internal/appointments/process-pending-timeout",
 			job.data,
-			{
-				headers: {
-					"x-internal-secret": process.env.INTERNAL_API_SECRET ?? "",
-				},
-			},
 		);
 
 		const { success, reason, notified, phone, adminId, whatsappMessage } =

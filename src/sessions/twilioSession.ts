@@ -4,6 +4,11 @@ import {
 	type CallerRefusalContext,
 	getCallerRefusalContext,
 } from "../api/callerAppointmentsApi.js";
+import {
+	getPeopleOnLine,
+	ownerOnly,
+	type PersonOnLine,
+} from "../api/callerPeopleApi.js";
 import { createCallEvent, ensureCallRow, updateCall } from "../api/callsApi.js";
 import { ensurePersonRow } from "../api/personsApi.js";
 import { getTwilioClient } from "../api/twilioClient.js";
@@ -69,6 +74,8 @@ export class TwilioSession {
 	private callerPhone: string | null = null;
 	/** Alternatives to offer when a doctor refused this caller's last request. */
 	private refusalContext: CallerRefusalContext | null = null;
+	/** Everyone on the caller's phone, for "who is this appointment for?". */
+	private peopleOnLine: PersonOnLine[] = [];
 
 	/** DB id of the person record for this caller (set once callerPhone is known). */
 	private personId: number | null = null;
@@ -247,6 +254,7 @@ export class TwilioSession {
 			language: this.callerPreferredLanguage,
 			firstName: this.callerFirstName,
 			callerPhone: this.callerPhone,
+			people: this.peopleOnLine,
 			refusalContext: this.refusalContext,
 			callbackReason: this.callbackReason,
 		});
@@ -451,8 +459,11 @@ export class TwilioSession {
 						void Promise.all([
 							ensurePersonRow(this.callerPhone),
 							getCallerRefusalContext(this.callerPhone),
-						]).then(([row, refusalContext]) => {
+							getPeopleOnLine(this.callerPhone),
+						]).then(([row, refusalContext, people]) => {
 							this.refusalContext = refusalContext;
+							this.peopleOnLine =
+								people.length > 0 ? people : row ? ownerOnly(row) : [];
 							if (row != null) {
 								this.applyPersonRow(row);
 								this.sendSessionConfig();

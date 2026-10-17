@@ -1,6 +1,7 @@
 /** Prompt text shared by every call path (Twilio media stream, LiveKit agent). */
 
 import type { CallerRefusalContext } from "../api/callerAppointmentsApi.js";
+import type { PersonOnLine } from "../api/callerPeopleApi.js";
 
 export type CallLanguage = "en" | "fr" | "ar";
 
@@ -86,6 +87,8 @@ export type CallerProfile = {
 	language: CallLanguage;
 	firstName?: string | null;
 	callerPhone?: string | null;
+	/** Everyone on the caller's phone (owner first); who an appointment can be for. */
+	people?: PersonOnLine[];
 	/** Set when a doctor recently refused this caller's request. */
 	refusalContext?: CallerRefusalContext | null;
 	/** Set when Riaya placed the call (outbound callback). */
@@ -136,6 +139,32 @@ Now in Tunisia (GMT+1): **${local}**. In UTC: \`${now.toISOString()}\`.
 Use this for "today", "tomorrow", weekdays, and as \`preferred_time\` when the patient has no preference.`;
 }
 
+const RELATIONSHIP_LABEL: Record<PersonOnLine["relationship"], string> = {
+	self: "the phone owner (usually the caller)",
+	child: "child of the phone owner",
+	parent: "parent of the phone owner",
+	spouse: "spouse of the phone owner",
+	sibling: "sibling of the phone owner",
+	other: "family member of the phone owner",
+};
+
+function buildPeopleBlock(people: PersonOnLine[]): string {
+	if (people.length === 0) return "";
+	const lines = people
+		.map((p) => {
+			const name =
+				[p.firstName, p.lastName].filter(Boolean).join(" ") ||
+				"name not on file yet";
+			return `- \`patient_person_id\` **${p.personId}**: ${name} — ${RELATIONSHIP_LABEL[p.relationship]}`;
+		})
+		.join("\n");
+	return `
+
+## PEOPLE ON THIS LINE
+People already known on this phone. Use their \`patient_person_id\` when booking for one of them:
+${lines}`;
+}
+
 /** Full session instructions: base system prompt + caller profile / language / phone blocks. */
 export function buildCallInstructions(
 	systemPrompt: string,
@@ -161,7 +190,7 @@ If they ask to speak a language **different from ${lang}** (English, French, or 
 		? buildCallbackBlock(profile.callbackReason)
 		: "";
 	if (!profile.callerPhone) return `${instructions}${callback}`;
-	const withPhone = `${instructions}${callback}
+	const withPhone = `${instructions}${callback}${buildPeopleBlock(profile.people ?? [])}
 
 ## CALLER PHONE (THIS LINE)
 The phone number for this call is: **${profile.callerPhone}**.

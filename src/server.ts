@@ -130,15 +130,10 @@ app.post("/send-whatsapp", async (req: Request, res: Response) => {
 		// Enforce plan limit unless the web app already consumed quota
 		if (!quotaConsumed && resolvedUserId !== "admin") {
 			try {
-				await nextjsApi.post(
-					"/api/internal/billing/consume-whatsapp",
-					{ userId: resolvedUserId, count: 1 },
-					{
-						headers: {
-							"x-internal-secret": process.env.INTERNAL_API_SECRET ?? "",
-						},
-					},
-				);
+				await nextjsApi.post("/api/internal/billing/consume-whatsapp", {
+					userId: resolvedUserId,
+					count: 1,
+				});
 			} catch (quotaErr: unknown) {
 				const ax = quotaErr as {
 					response?: { status?: number; data?: { error?: string } };

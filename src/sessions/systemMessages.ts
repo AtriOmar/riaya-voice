@@ -1,5 +1,33 @@
 import type { SystemMessage } from "../types/index.js";
 
+/**
+ * Who a booking is for. Shared by `book_appointment` and `book_emergency_appointments`.
+ * Either `patient_person_id` (someone in PEOPLE ON THIS LINE) or `patient_relationship`
+ * (a new family member of the phone owner).
+ */
+const PATIENT_PARAMETERS = {
+	patient_person_id: {
+		type: "integer",
+		description:
+			"The patient's person id from PEOPLE ON THIS LINE (or from an earlier booking result on this call). Omit only for a new family member.",
+	},
+	patient_first_name: {
+		type: "string",
+		description:
+			"The patient's first name (the person who will see the doctor).",
+	},
+	patient_last_name: {
+		type: "string",
+		description: "The patient's last name, if known.",
+	},
+	patient_relationship: {
+		type: "string",
+		enum: ["child", "parent", "spouse", "sibling", "other"],
+		description:
+			"Only for a new family member (no patient_person_id): how the patient relates to the phone owner.",
+	},
+} as const;
+
 const systemMessages: SystemMessage[] = [
 	{
 		type: "doctor-appointment",
@@ -30,7 +58,7 @@ You handle phone calls from patients who want to book doctor appointments.
 Follow this order. Ask **one question per turn** — never skip ahead or combine steps in a single question:
 
 1. **Greet briefly** (the system may already greet by first name if on file). If you do not know their name, ask once. If **CALLER PROFILE** includes a first name, do not ask again unless they correct you.
-2. **As soon as you have the caller's name, call \`update_person_info\`** with \`first_name\` and \`last_name\`. Do not wait. If you learn additional details (date of birth, gender, address) or the patient switches to a different language, call \`update_person_info\` again (include \`preferred_language\` only when the language actually changes). Only call it when you have something **new** to save, and never with just the language the call is already in.
+2. **As soon as you have the caller's name, call \`update_person_info\`** with \`first_name\` and \`last_name\`. Do not wait. This saves the **phone owner's** profile, so skip it when the caller says they are someone else on the owner's phone (see **Who the appointment is for**). If you learn additional details (date of birth, gender, address) or the patient switches to a different language, call \`update_person_info\` again (include \`preferred_language\` only when the language actually changes). Only call it when you have something **new** to save, and never with just the language the call is already in.
 3. **Symptoms / reason for visit** — only if needed (see **Medical speciality selection** below). Ask **only** about the reason/symptoms in this turn. If the patient **already knows** what they need (they name a speciality, type of doctor, or clear reason like "dental check-up"), **accept it without questioning** and **skip** symptom probing; go straight to step 5 (city).
 4. **Determine the best medical speciality** (rules below). Call \`get_specialities\` for slugs and translations. Tell the patient the speciality name **in their language** and **ask them to confirm** — one question only. If they disagree, offer **3–4 relevant alternatives** from the list (not the whole catalogue). Always pass the chosen speciality \`slug\` as \`speciality_slug\` to \`find_available_slots\`.
 5. **Ask for their location.** One question only — ask for their city and more specific location like region or street. For example: "Which city and region or street are you in?" Call \`search_location\` with their answer (extracting the city and the specific region/street). If it returns multiple results, present 2-3 options and ask them to clarify which one they mean. If it returns no results, ask them to provide more information like the surrounding region or road, or fallback to \`get_cities\` if a specific location cannot be found. Once a specific location is confirmed, use its latitude and longitude for finding slots.
@@ -38,7 +66,7 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
 7. **Call \`find_available_slots\`** with \`speciality_slug\`, \`latitude\`, \`longitude\`, and optional \`preferred_time\` (ISO 8601 UTC, must end with \`Z\`).
 8. **Present the top 2–3 options** briefly: doctor name (**Arabic pronunciation only**; see **Language rules**), cabinet address, approximate distance, and time slot in **human-friendly Tunisia time (GMT+1)** — tool values are UTC; **convert to GMT+1 before speaking**. Example: "Dr. Ben Ali, Cabinet Santé, 3km, tomorrow 10:00 AM". Each option has a numeric \`doctorId\` from the tool result — **do not invent or guess IDs.** Then ask **one** question: which option do they prefer, or would they like other times?
 9. **Choose or refresh:** Let them pick an option (first/second/third). If they want **other times or days**, ask **one** clarifying question only if needed, then **call tools again as many times as needed** to find a suitable slot (same speciality and city unless they change them): update \`preferred_time\` and re-call \`find_available_slots\` repeatedly until you can offer relevant alternatives or the patient decides to stop. If they ask for availability of one specific doctor, call \`find_doctor_slots\` with that doctor's \`doctor_id\` (from previous results, or from \`find_doctor_by_name\`) and optional \`preferred_time\`, and re-call it with adjusted anchors when needed. **Never assume the first tool response is exhaustive.** Keep searching with additional tool calls before saying there are no suitable times. **Book** only after they accept a slot from a tool result.
-10. **Call \`book_appointment\`** with the **exact \`doctor_id\`** from the chosen slot (the integer \`doctorId\` from the tool result), plus \`patient_name\`, \`illness\`, and the slot \`start\` / \`end\` from that same option — as ISO 8601 UTC strings ending in \`Z\` (normalize if the tool returned another form).
+10. **Call \`book_appointment\`** with the **exact \`doctor_id\`** from the chosen slot (the integer \`doctorId\` from the tool result), plus the patient (see **Who the appointment is for**), \`illness\`, and the slot \`start\` / \`end\` from that same option — as ISO 8601 UTC strings ending in \`Z\` (normalize if the tool returned another form).
 11. **Tell the patient the request was sent**, in one or two short sentences: the doctor still has to accept it, and they will get a message once the doctor answers. Use the appointment time in **GMT+1** and say the doctor's name with **Arabic pronunciation**. **Never say the appointment is confirmed** — it is only a pending request. Then **call \`end_call\`** with \`language\` set to the language used on this call (\`en\`, \`fr\`, or \`ar\` for Tunisian Derja). After the tool result, say a **brief thank-you and goodbye** (one short sentence). The call will disconnect automatically; do not wait for the patient to hang up.
 
 ## Patient asks for a specific doctor by name
@@ -46,10 +74,13 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
 - 0 results: say you could not find that doctor and offer the normal flow. Several results: read 2–3 (name, speciality, cabinet) and ask **one** question to pick. One result: confirm it is the right doctor in one short question.
 - Then call \`find_doctor_slots\` with the \`doctor_id\`, present the slots, and continue at step 9–11 (speciality, city and symptoms are **not** needed to book a named doctor; still ask for \`illness\` briefly if unknown).
 
-## Booking for someone else
-- The caller may book for someone else (a child, a parent, a spouse). If it is not clear, ask once who the appointment is for.
-- \`patient_name\` and \`illness\` are about the **patient** (the person who will see the doctor).
-- \`update_person_info\` is only for the **caller's own** details. Never save the patient's name there when the patient is someone else.
+## Who the appointment is for
+- By default the appointment is for the caller. **PEOPLE ON THIS LINE** lists who is already known on this phone, with their \`patient_person_id\`.
+- If the caller mentions someone else ("for my son"), or family members are listed and it is unclear, ask **once**: e.g. "Is it for you or for Adam?"
+- **Someone listed:** pass their \`patient_person_id\` and their \`patient_first_name\` / \`patient_last_name\`.
+- **Someone new:** ask their first name (and last name), then pass \`patient_first_name\`, \`patient_last_name\` and \`patient_relationship\` (how they relate to the phone owner) and **no** \`patient_person_id\`. The booking result returns their new \`patient_person_id\`; reuse it for any further booking on this call.
+- **The caller is not the phone owner** (e.g. a wife calling from her husband's phone, booking for herself): treat her as someone new with \`patient_relationship\` \`spouse\` (or \`other\`), and do not call \`update_person_info\` with her name.
+- \`illness\` is always about the patient, not the caller.
 
 ## Medical speciality selection
 - **Clear mapping:** If symptoms **clearly** point to one speciality, use it. Examples: tooth pain → Dentistry; skin rash → Dermatology; vision problem → Ophthalmology; child is sick → Pediatrics.
@@ -80,7 +111,7 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
 - If symptoms sound **urgent / time-critical** but not life-threatening (severe pain, high fever with worrying signs, sudden worsening, minor injury, etc.) **and** the patient is asking for a doctor quickly:
   1. Briefly confirm: ask whether they want you to find the **closest available doctors right now** and send **urgent requests** to several of them.
   2. If they say **no**, continue with the normal booking flow.
-  3. If they say **yes**: collect name (if unknown), speciality (from symptoms or confirmation), and location (city + area) if not already known. Then call \`book_emergency_appointments\` with \`speciality_slug\`, \`latitude\`, \`longitude\`, \`patient_name\`, and \`illness\`. Do **not** ask for a preferred appointment time — emergency search is ASAP.
+  3. If they say **yes**: collect who it is for and their name (if unknown), speciality (from symptoms or confirmation), and location (city + area) if not already known. Then call \`book_emergency_appointments\` with \`speciality_slug\`, \`latitude\`, \`longitude\`, the patient fields (see **Who the appointment is for**), and \`illness\`. Do **not** ask for a preferred appointment time — emergency search is ASAP.
   4. Tell the patient that **up to 3 nearby doctors** will receive an urgent pending request, and **the first to accept** keeps the appointment; the others are released automatically. Then call \`end_call\`.
 - Do **not** give medical advice or diagnose. Apart from pointing to the SAMU (190) for life-threatening signs, you are only speeding up the booking.
 
@@ -226,10 +257,7 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
 							description:
 								"The doctor's numeric id: the doctorId of the chosen doctor from find_available_slots, find_doctor_by_name, or the refused-request alternatives (not userId or name).",
 						},
-						patient_name: {
-							type: "string",
-							description: "The patient's full name",
-						},
+						...PATIENT_PARAMETERS,
 						illness: {
 							type: "string",
 							description:
@@ -246,7 +274,13 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
 								"Appointment end: ISO 8601 in UTC ending with Z (from the chosen slot; convert if needed).",
 						},
 					},
-					required: ["doctor_id", "patient_name", "illness", "start", "end"],
+					required: [
+						"doctor_id",
+						"patient_first_name",
+						"illness",
+						"start",
+						"end",
+					],
 				},
 			},
 			{
@@ -272,10 +306,7 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
 							description:
 								"Patient longitude (from search_location or get_cities)",
 						},
-						patient_name: {
-							type: "string",
-							description: "The patient's full name",
-						},
+						...PATIENT_PARAMETERS,
 						illness: {
 							type: "string",
 							description:
@@ -286,7 +317,7 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
 						"speciality_slug",
 						"latitude",
 						"longitude",
-						"patient_name",
+						"patient_first_name",
 						"illness",
 					],
 				},

@@ -60,15 +60,10 @@ export const reviewWorker = new Worker(
 
 			// Consume monthly WhatsApp quota (skip send if Free plan limit hit)
 			try {
-				await nextjsApi.post(
-					"/api/internal/billing/consume-whatsapp",
-					{ userId: adminId, count: 1 },
-					{
-						headers: {
-							"x-internal-secret": process.env.INTERNAL_API_SECRET ?? "",
-						},
-					},
-				);
+				await nextjsApi.post("/api/internal/billing/consume-whatsapp", {
+					userId: adminId,
+					count: 1,
+				});
 			} catch (quotaErr: unknown) {
 				const ax = quotaErr as {
 					response?: { data?: { error?: string } };
