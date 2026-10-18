@@ -13,6 +13,7 @@ import express, {
 import { pino } from "pino";
 import { type WebSocket, WebSocketServer } from "ws";
 import { isCallerBlocked } from "./api/abuseApi.js";
+import { startCallRecording } from "./api/callRecording.js";
 import { ensureCallRow } from "./api/callsApi.js";
 import { nextjsApi } from "./api/nextjsApiClient.js";
 import { ensurePersonRow } from "./api/personsApi.js";
@@ -249,6 +250,14 @@ app.all("/incoming-call", async (req: Request, res: Response) => {
 	);
 
 	res.type("text/xml").send(twiml);
+
+	// Record after answering with the TwiML (the call is live by now). Blocked
+	// callers returned above and are never recorded.
+	if (callSid) {
+		startCallRecording(callSid, logger).catch((err) =>
+			logger.error({ err }, "🔥 Failed to start call recording"),
+		);
+	}
 });
 
 /**
