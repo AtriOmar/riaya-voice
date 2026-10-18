@@ -58,26 +58,6 @@ export const reviewWorker = new Worker(
 				throw new Error("WhatsApp not connected");
 			}
 
-			// Consume monthly WhatsApp quota (skip send if Free plan limit hit)
-			try {
-				await nextjsApi.post("/api/internal/billing/consume-whatsapp", {
-					userId: adminId,
-					count: 1,
-				});
-			} catch (quotaErr: unknown) {
-				const ax = quotaErr as {
-					response?: { data?: { error?: string } };
-				};
-				if (ax.response?.data?.error === "WHATSAPP_LIMIT_REACHED") {
-					logger.info(
-						{ appointmentId, adminId },
-						"[ReviewWorker] WhatsApp limit reached — skipping review message",
-					);
-					return;
-				}
-				throw quotaErr;
-			}
-
 			if (!message) {
 				logger.error(
 					{ appointmentId },
