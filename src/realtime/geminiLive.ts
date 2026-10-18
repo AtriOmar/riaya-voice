@@ -194,6 +194,16 @@ export class GeminiLiveProvider implements RealtimeProvider {
 		});
 	}
 
+	prompt(instructions: string) {
+		if (!this.setupComplete) return;
+		this.send({
+			clientContent: {
+				turns: [{ role: "user", parts: [{ text: instructions }] }],
+				turnComplete: true,
+			},
+		});
+	}
+
 	enterClosingMode() {
 		// No VAD toggle mid-session: just stop forwarding caller audio.
 		this.closing = true;

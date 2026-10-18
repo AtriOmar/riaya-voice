@@ -12,6 +12,7 @@ import express, {
 } from "express";
 import { pino } from "pino";
 import { type WebSocket, WebSocketServer } from "ws";
+import { isCallerBlocked } from "./api/abuseApi.js";
 import { ensureCallRow } from "./api/callsApi.js";
 import { nextjsApi } from "./api/nextjsApiClient.js";
 import { ensurePersonRow } from "./api/personsApi.js";
@@ -182,7 +183,7 @@ app.post("/twilio/callback-status", (req: Request, res: Response) => {
 });
 
 // Twilio webhook: returns TwiML to connect the call to a media stream
-app.all("/incoming-call", (req: Request, res: Response) => {
+app.all("/incoming-call", async (req: Request, res: Response) => {
 	// Host for wss://…/media-stream must reach THIS realtime server (ngrok/tunnel), not Next.js.
 	const fromEnv = process.env.PUBLIC_SOCKET_HOST?.trim()
 		.replace(/^https?:\/\//i, "")
@@ -222,6 +223,19 @@ app.all("/incoming-call", (req: Request, res: Response) => {
 		{ host, hasCallerPhone: patientPhone.length > 0, callSid, isCallback },
 		"📞 Incoming call webhook",
 	);
+
+	// Numbers an admin blocked never reach the AI: Twilio rejects the call before
+	// any media stream starts. Callbacks are ours to place, so they skip this.
+	if (!isCallback && patientPhone && (await isCallerBlocked(patientPhone))) {
+		logger.info({ callSid }, "🚫 Blocked number rejected");
+		res.type("text/xml").send(
+			`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Reject reason="busy" />
+</Response>`,
+		);
+		return;
+	}
 
 	// Fire-and-forget: create the call row and person in Next.js. TwilioSession
 	// will await the same cached promises before persisting events / updating person.

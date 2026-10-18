@@ -30,11 +30,15 @@ import { CITIES } from "../constants/cities.js";
 import { SPECIALITIES } from "../constants/specialities.js";
 import {
 	buildCallInstructions,
+	buildHangupToolResult,
 	buildInitialGreetingInstructions,
+	buildWatchdogInstructions,
 	type CallLanguage,
 	LANGUAGE_LABEL,
 	normalizeCallLanguage,
+	type WatchdogPrompt,
 } from "../sessions/callInstructions.js";
+import { CallWatchdog } from "../sessions/callWatchdog.js";
 import { getSystemMessage } from "../sessions/systemMessages.js";
 import {
 	type CallSettings,
@@ -653,22 +657,29 @@ export default defineAgent({
 			persistCallUpdate,
 		});
 
-		const endCall = (args: unknown): string => {
+		const endCall = (args: unknown, reason: "done" | "abuse"): string => {
+			watchdog.stop();
 			pendingHangup = true;
-			const lang = normalizeCallLanguage(
-				(args as { language?: string } | null)?.language ?? language,
-			);
-			const langHint =
-				lang === "fr"
-					? "French"
-					: lang === "en"
-						? "English"
-						: "Tunisian Arabic (Derja)";
 			setTimeout(() => hangUp("fallback"), END_CALL_MAX_WAIT_MS);
-			return JSON.stringify({
-				success: true,
-				message: `Call disconnect is scheduled when this response finishes. Say a brief thank-you and goodbye to the patient now (one short sentence, ${langHint}). Do not call other tools.`,
-			});
+			return buildHangupToolResult(
+				normalizeCallLanguage(
+					(args as { language?: string } | null)?.language ?? language,
+				),
+				reason,
+			);
+		};
+
+		const executeTool = async (
+			name: string,
+			args: unknown,
+		): Promise<string> => {
+			if (name === "end_call") return endCall(args, "done");
+			if (name === "report_abuse") {
+				// Report first, then hang up whatever the report returned.
+				await callTools.run(name, args);
+				return endCall(args, "abuse");
+			}
+			return callTools.run(name, args);
 		};
 
 		const runTool = async (name: string, args: unknown): Promise<string> => {
@@ -687,8 +698,7 @@ export default defineAgent({
 				functionStatus: "calling",
 			});
 			try {
-				const result =
-					name === "end_call" ? endCall(args) : await callTools.run(name, args);
+				const result = await executeTool(name, args);
 				relay.send({
 					type: "function_call",
 					callSid,
@@ -752,6 +762,8 @@ export default defineAgent({
 			llm: model,
 			tts: tts ?? undefined,
 			vad: ctx.proc.userData.vad as silero.VAD,
+			// Silence is handled by CallWatchdog, shared with the media-stream path.
+			userAwayTimeout: null,
 			// GPT-Live detects the end of each turn itself.
 			turnHandling: GPT_LIVE
 				? undefined
@@ -768,12 +780,50 @@ export default defineAgent({
 		const hangUp = (reason: string) => {
 			if (hangupScheduled) return;
 			hangupScheduled = true;
+			watchdog.stop();
 			log.info({ reason }, "📴 Ending call");
 			void ctx
 				.deleteRoom()
 				.catch((err) => log.error({ err }, "🔥 Failed to delete room"))
 				.finally(() => ctx.shutdown("call ended"));
 		};
+
+		// ---------- silence / time limit ----------
+		/** Say one goodbye line, then hang up once it has played (like end_call). */
+		const endWithGoodbye = (prompt: WatchdogPrompt, note: string) => {
+			if (pendingHangup || hangupScheduled) return;
+			log.info({ prompt }, "📴 Watchdog ending call");
+			persistEvent({ type: "system", content: note });
+			pendingHangup = true;
+			setTimeout(() => hangUp("fallback"), END_CALL_MAX_WAIT_MS);
+			session.generateReply({
+				instructions: buildWatchdogInstructions(prompt, language),
+				allowInterruptions: false,
+			});
+		};
+		const watchdog = new CallWatchdog(log, {
+			onAskStillThere: () =>
+				session.generateReply({
+					instructions: buildWatchdogInstructions("still_there", language),
+				}),
+			onSilentGoodbye: () =>
+				endWithGoodbye(
+					"silent_goodbye",
+					"Call ended: the caller stayed silent.",
+				),
+			onTimeLimit: () =>
+				endWithGoodbye(
+					"time_limit_goodbye",
+					"Call ended: the call time limit was reached.",
+				),
+		});
+		session.on(voice.AgentSessionEventTypes.UserStateChanged, (ev) => {
+			if (ev.newState === "speaking") watchdog.callerSpoke();
+		});
+		// thinking covers tool calls; listening means the reply has finished playing.
+		session.on(voice.AgentSessionEventTypes.AgentStateChanged, (ev) => {
+			watchdog.setAssistantSpeaking(ev.newState !== "listening");
+		});
 
 		// The reply that follows the end_call result is the goodbye; hang up once
 		// it has finished playing.
@@ -914,6 +964,7 @@ export default defineAgent({
 		});
 
 		const finishCall = () => {
+			watchdog.stop();
 			if (callEnded) return;
 			callEnded = true;
 			profileAbort.abort();
@@ -976,6 +1027,7 @@ export default defineAgent({
 		session.generateReply({
 			instructions: buildInitialGreetingInstructions(language, firstName),
 		});
+		watchdog.start();
 	},
 });
 

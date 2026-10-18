@@ -51,6 +51,8 @@ export interface RealtimeProvider {
 	/** Tell the model how much of an interrupted reply the caller actually heard. */
 	truncate(itemId: string, audioEndMs: number): void;
 	sendFunctionResult(call: RealtimeFunctionCall, output: string): void;
+	/** Make the assistant speak now, following `instructions` (e.g. "are you still there?"). */
+	prompt(instructions: string): void;
 	/** Stop reacting to caller speech (goodbye is playing, hangup pending). */
 	enterClosingMode(): void;
 	close(): void;

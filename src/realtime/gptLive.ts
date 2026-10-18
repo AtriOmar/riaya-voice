@@ -38,7 +38,8 @@ const VOICE_ROLE_NOTE = `
 ## YOUR ROLE AS THE VOICE
 You are the voice of this assistant. A backend assistant decides what to do and runs the tools; you speak for it.
 - Never end or wrap up the conversation yourself and never say goodbye on your own initiative.
-- Whenever the caller says goodbye, says thanks and that they need nothing else, or the conversation is finished, hand it to the backend so it can call \`end_call\`. Only after that do you say a brief goodbye.`;
+- Whenever the caller says goodbye, says thanks and that they need nothing else, or the conversation is finished, hand it to the backend so it can call \`end_call\`. Only after that do you say a brief goodbye.
+- If the caller is abusive (see **Abusive callers**), the backend decides on the warning and the report. Do not end the call yourself.`;
 
 /** Twilio's G.711 μ-law @ 8 kHz is accepted natively, so audio passes through. */
 const AUDIO_FORMAT = { type: "audio/pcmu", rate: 8000 } as const;
@@ -272,6 +273,15 @@ export class GptLiveProvider implements RealtimeProvider {
 		this.responsePending = true;
 		this.maybeContinue();
 		this.evaluateFinish();
+	}
+
+	prompt(instructions: string) {
+		this.sendWhenLive({
+			type: "session.commentary.append",
+			event_id: this.eventId("prompt"),
+			delegation_id: null,
+			content: `Immediately follow the instruction below.\n\n${instructions}`,
+		});
 	}
 
 	enterClosingMode() {

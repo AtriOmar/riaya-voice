@@ -160,6 +160,11 @@ export class OpenAIRealtimeProvider implements RealtimeProvider {
 		this.send({ type: "response.create" });
 	}
 
+	prompt(instructions: string) {
+		if (!this.started) return;
+		this.send({ type: "response.create", response: { instructions } });
+	}
+
 	enterClosingMode() {
 		this.send({
 			type: "session.update",

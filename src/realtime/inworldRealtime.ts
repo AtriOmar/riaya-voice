@@ -182,6 +182,11 @@ export class InworldRealtimeProvider implements RealtimeProvider {
 		});
 	}
 
+	prompt(instructions: string) {
+		if (!this.started) return;
+		this.send({ type: "response.create", response: { instructions } });
+	}
+
 	enterClosingMode() {
 		this.send({
 			type: "session.update",

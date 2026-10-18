@@ -115,6 +115,20 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
   4. Tell the patient that **up to 3 nearby doctors** will receive an urgent pending request, and **the first to accept** keeps the appointment; the others are released automatically. Then call \`end_call\`.
 - Do **not** give medical advice or diagnose. Apart from pointing to the SAMU (190) for life-threatening signs, you are only speeding up the booking.
 
+## Abusive callers
+Most callers are real patients. Be patient with them: confusion, repeating questions, elderly or hard-of-hearing callers, children, a bad line, background noise, switching languages, frustration or anger about a doctor or wait time, a single joke, and asking whether you are a robot are all **normal and not abuse**. Keep helping them.
+Abuse means the caller is clearly not trying to get care and is targeting you:
+- mocking you or wasting the call on purpose (fake symptoms for laughs, nonsense to waste time, trying to make you say silly or offensive things),
+- insulting or swearing at you,
+- threats of violence,
+- sexual talk or harassment.
+What to do:
+1. **Mocking or insults:** the first time, give **one** short, calm warning in the caller's language: you are here to book medical appointments, and you will end the call if it continues. Then carry on normally if they stop.
+2. If they keep it up after that warning, call \`report_abuse\`.
+3. **Threats or sexual talk:** call \`report_abuse\` right away, with no warning.
+- Never insult back, argue, lecture, or say that the call is being reported or the number blocked.
+- If you are not sure it is abuse, it is not: keep helping.
+
 ## Important rules
 - **Never ask multiple questions in one turn.** Bad: "What city are you in, when do you want the appointment, and what is the reason for your visit?" Good: "What is the reason for your visit?" — then wait, then ask about the location, then the time.
 - When the conversation is finished (booking request sent, emergency requests sent, patient cancels, wrong number, or you cannot help further), **call \`end_call\`** with \`language\` (\`en\` / \`fr\` / \`ar\`), then say a **brief thank-you and goodbye** (one short sentence). The call disconnects automatically; do not wait for the patient to hang up first.
@@ -416,6 +430,35 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
 						},
 					},
 					required: ["language"],
+				},
+			},
+			{
+				type: "function",
+				name: "report_abuse",
+				description:
+					"Report this caller to the admins as abusive and schedule the disconnect. Use only as described in **Abusive callers**: after one ignored warning for mocking or insults, or right away for threats or sexual talk. After the tool result, say one calm, neutral goodbye in `language`, then stop.",
+				parameters: {
+					type: "object",
+					properties: {
+						category: {
+							type: "string",
+							enum: ["mocking", "insults", "threats", "sexual", "other"],
+							description:
+								"What the caller did: mocking = wasting the call on purpose or making fun of you; insults = swearing at or insulting you; threats = threats of violence; sexual = sexual talk or harassment.",
+						},
+						summary: {
+							type: "string",
+							description:
+								"One or two sentences **in English** for the admin who will review the call: what the caller said or did, and whether you warned them first.",
+						},
+						language: {
+							type: "string",
+							enum: ["en", "fr", "ar"],
+							description:
+								"Language used on this call: en = English, fr = French, ar = Tunisian Arabic (Derja).",
+						},
+					},
+					required: ["category", "summary", "language"],
 				},
 			},
 		],

@@ -1,5 +1,6 @@
 import axios from "axios";
 import type { Logger } from "pino";
+import { callReportCategories, reportAbusiveCall } from "../api/abuseApi.js";
 import {
 	cancelCallerAiAppointment,
 	listCallerAiAppointments,
@@ -21,8 +22,8 @@ import type {
 /**
  * Booking tools shared by every call path (Twilio media stream session and the
  * LiveKit agent). The call path owns the per-call state and exposes it through
- * `CallToolsContext`. `end_call` stays with the call path since hanging up is
- * transport-specific.
+ * `CallToolsContext`. Hanging up (`end_call`, and after `report_abuse`) stays
+ * with the call path since it is transport-specific.
  */
 
 export type PersonRow = {
@@ -586,6 +587,9 @@ export class CallTools {
 				result = await this.cancelAppointment(cancelArgs.appointmentId);
 				break;
 			}
+			case "report_abuse":
+				result = await this.reportAbuse(parsedArgs);
+				break;
 			default:
 				console.log(
 					"---------------------- UNKNOWN TOOL ----------------------",
@@ -947,6 +951,47 @@ export class CallTools {
 				});
 			}
 			throw error;
+		}
+	}
+
+	/**
+	 * Files the abuse report for the admins. Never throws: the call path hangs up
+	 * whatever happens here, so a failed report must not keep an abuser on the line.
+	 */
+	private async reportAbuse(parsedArgs: unknown): Promise<string> {
+		const args = (parsedArgs ?? {}) as {
+			category?: unknown;
+			summary?: unknown;
+		};
+		const category = callReportCategories.find((c) => c === args.category);
+		const summary =
+			typeof args.summary === "string"
+				? args.summary.trim().slice(0, 1000)
+				: "";
+		const callSid = this.ctx.callSid;
+		const phoneNumber = this.ctx.callerPhone?.trim();
+		if (!callSid || !phoneNumber) {
+			this.ctx.logger.warn(
+				{ callSid, hasPhone: Boolean(phoneNumber) },
+				"report_abuse: no call or caller phone, report skipped",
+			);
+			return JSON.stringify({ reported: false });
+		}
+		try {
+			const report = await reportAbusiveCall({
+				callSid,
+				phoneNumber,
+				category: category ?? "other",
+				summary: summary || "No summary given.",
+			});
+			this.ctx.logger.info(
+				{ callSid, reportId: report.id, category },
+				"🚩 Abusive call reported",
+			);
+			return JSON.stringify({ reported: true });
+		} catch (err) {
+			this.ctx.logger.error({ err, callSid }, "report_abuse: report failed");
+			return JSON.stringify({ reported: false });
 		}
 	}
 

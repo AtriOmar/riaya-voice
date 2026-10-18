@@ -37,12 +37,16 @@ import { CallerTranscriber } from "./callerTranscriber.js";
 import {
 	buildCallbackGreetingInstructions,
 	buildCallInstructions,
+	buildHangupToolResult,
 	buildInitialGreetingInstructions,
+	buildWatchdogInstructions,
 	type CallbackReason,
 	type CallLanguage,
 	normalizeCallbackReason,
 	normalizeCallLanguage,
+	type WatchdogPrompt,
 } from "./callInstructions.js";
+import { CallerVoiceDetector, CallWatchdog } from "./callWatchdog.js";
 
 function getTwilioRestClient() {
 	return getTwilioClient();
@@ -54,6 +58,11 @@ export class TwilioSession {
 	// Connection state
 	private provider: RealtimeProvider | null = null;
 	private readonly tools: CallTools;
+	/** Ends silent calls and caps call length. */
+	private readonly watchdog: CallWatchdog;
+	private readonly voiceDetector = new CallerVoiceDetector(() =>
+		this.watchdog.callerSpoke(),
+	);
 	/** Separate caller transcription; null when CALLER_STT=off (use the realtime model's transcript). */
 	private callerTranscriber: CallerTranscriber | null = null;
 	/** Provider connection is open and can accept `start()`. */
@@ -130,6 +139,19 @@ export class TwilioSession {
 	) {
 		this.logger.info("🟢 TwilioSession created");
 		this.tools = this.createTools();
+		this.watchdog = new CallWatchdog(this.logger, {
+			onAskStillThere: () => this.promptAssistant("still_there"),
+			onSilentGoodbye: () =>
+				this.endWithGoodbye(
+					"silent_goodbye",
+					"Call ended: the caller stayed silent.",
+				),
+			onTimeLimit: () =>
+				this.endWithGoodbye(
+					"time_limit_goodbye",
+					"Call ended: the call time limit was reached.",
+				),
+		});
 		this.initialize().catch((error) =>
 			this.logger.error({ error }, "🔥 Failed to initialize TwilioSession"),
 		);
@@ -318,6 +340,7 @@ export class TwilioSession {
 			},
 			"🗣️ Session started, initial greeting triggered",
 		);
+		this.watchdog.start();
 	}
 
 	/** Refresh instructions after the session started (profile / language changed). */
@@ -362,6 +385,7 @@ export class TwilioSession {
 	}
 
 	private handlePatientTranscript(transcript: string) {
+		this.watchdog.callerSpoke();
 		if (!this.callSid) return;
 		this.logger.info({ transcript }, "📝 Patient said");
 		this.broadcastDashboard({
@@ -508,6 +532,7 @@ export class TwilioSession {
 					// Forward audio to the realtime model
 					this.provider?.sendAudio(msg.media.payload);
 					this.callerTranscriber?.push(msg.media.payload);
+					this.voiceDetector.push(msg.media.payload);
 
 					// Forward audio to dashboard clients listening to this call
 					if (this.callSid) {
@@ -522,6 +547,10 @@ export class TwilioSession {
 				case "mark":
 					if (this.markQueue.length > 0) {
 						this.markQueue.shift();
+					}
+					// Playback drained: the caller has heard everything said so far.
+					if (this.markQueue.length === 0) {
+						this.watchdog.setAssistantSpeaking(false);
 					}
 					this.tryScheduleHangupAfterPlayback();
 					break;
@@ -543,6 +572,7 @@ export class TwilioSession {
 	private handleAudioDelta(payload: string, itemId?: string) {
 		if (!payload || !this.streamSid) return;
 		if (this.pendingHangup) this.goodbyeAudioStarted = true;
+		this.watchdog.setAssistantSpeaking(true);
 
 		// Send audio back to Twilio
 		this.twilioWs.send(
@@ -591,6 +621,7 @@ export class TwilioSession {
 	/** Handle interruption: patient starts speaking while AI is responding */
 	private handleSpeechStarted() {
 		if (this.pendingHangup) return;
+		this.watchdog.callerSpoke();
 		if (
 			this.markQueue.length > 0 &&
 			this.responseStartTimestampTwilio != null
@@ -618,6 +649,29 @@ export class TwilioSession {
 		}
 	}
 
+	// ==================== Watchdog (silence / time limit) ====================
+
+	private promptAssistant(prompt: WatchdogPrompt) {
+		this.provider?.prompt(
+			buildWatchdogInstructions(prompt, this.callerPreferredLanguage),
+		);
+	}
+
+	/** Say one goodbye line, then hang up the same way `end_call` does. */
+	private endWithGoodbye(prompt: WatchdogPrompt, note: string) {
+		if (this.pendingHangup || this.hangupScheduled) return;
+		this.logger.info(
+			{ callSid: this.callSid, prompt },
+			"📴 Watchdog ending call",
+		);
+		this.persistEvent({ type: "system", content: note });
+		this.pendingHangup = true;
+		this.goodbyeAudioStarted = false;
+		this.promptAssistant(prompt);
+		this.provider?.enterClosingMode();
+		this.scheduleFallbackHangup();
+	}
+
 	// ==================== Function Calling ====================
 
 	private sendFunctionCallOutput(call: RealtimeFunctionCall, output: string) {
@@ -625,6 +679,7 @@ export class TwilioSession {
 	}
 
 	private onResponseDone() {
+		if (this.markQueue.length === 0) this.watchdog.setAssistantSpeaking(false);
 		// Hang up only after the goodbye turn, not the turn that called `end_call`.
 		if (this.pendingHangup && this.goodbyeAudioStarted) {
 			this.hangupAfterPlayback = true;
@@ -801,37 +856,36 @@ export class TwilioSession {
 			});
 		}
 
+		this.watchdog.toolStarted();
 		try {
 			let result: string;
 			let scheduleHangupAfterOutput = false;
 
 			switch (name) {
 				case "end_call":
+				case "report_abuse":
+					// Report first so the admins get it even if the hangup fails below.
+					if (name === "report_abuse") {
+						await this.tools.run(name, parsedArgs, call_id);
+					}
 					if (!this.callSid) {
 						result = JSON.stringify({
 							error: true,
-							message: "end_call: no active call",
+							message: `${name}: no active call`,
 						});
 					} else if (!this.isSimulated && !getTwilioRestClient()) {
 						result = JSON.stringify({
 							error: true,
-							message: "end_call: Twilio credentials not configured",
+							message: `${name}: Twilio credentials not configured`,
 						});
 					} else {
 						scheduleHangupAfterOutput = true;
-						const lang = normalizeCallLanguage(
-							(parsedArgs as { language?: string }).language,
+						result = buildHangupToolResult(
+							normalizeCallLanguage(
+								(parsedArgs as { language?: string }).language,
+							),
+							name === "report_abuse" ? "abuse" : "done",
 						);
-						const langHint =
-							lang === "fr"
-								? "French"
-								: lang === "en"
-									? "English"
-									: "Tunisian Arabic (Derja)";
-						result = JSON.stringify({
-							success: true,
-							message: `Call disconnect is scheduled when this response finishes. Say a brief thank-you and goodbye to the patient now (one short sentence, ${langHint}). Do not call other tools.`,
-						});
 					}
 					break;
 				default:
@@ -891,6 +945,7 @@ export class TwilioSession {
 			}
 
 			if (scheduleHangupAfterOutput) {
+				this.watchdog.stop();
 				// Set before sending the result so the goodbye audio is recognised.
 				this.pendingHangup = true;
 				this.goodbyeAudioStarted = false;
@@ -944,6 +999,8 @@ export class TwilioSession {
 					message: reason,
 				}),
 			);
+		} finally {
+			this.watchdog.toolFinished();
 		}
 	}
 
@@ -985,6 +1042,7 @@ export class TwilioSession {
 
 	dispose() {
 		this.logger.info("🗑️ Disposing TwilioSession");
+		this.watchdog.stop();
 		this.clearHangupTimers();
 		this.callerTranscriber?.close();
 

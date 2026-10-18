@@ -32,6 +32,27 @@ export function buildInitialGreetingInstructions(
 		: 'Say exactly one short sentence: "Hello, this is Riaya. How can I help you?" Do NOT call any functions.';
 }
 
+/** What the call watchdog (`callWatchdog.ts`) needs the assistant to say. */
+export type WatchdogPrompt =
+	| "still_there"
+	| "silent_goodbye"
+	| "time_limit_goodbye";
+
+export function buildWatchdogInstructions(
+	prompt: WatchdogPrompt,
+	lang: CallLanguage,
+): string {
+	const label = LANGUAGE_LABEL[lang];
+	switch (prompt) {
+		case "still_there":
+			return `[System note] The caller has not said anything for a while. In one short sentence in ${label}, ask whether they are still there. Do not repeat your last question and do not call any functions.`;
+		case "silent_goodbye":
+			return `[System note] The caller is still silent, so this call is ending. In one short sentence in ${label}, say you could not hear them, invite them to call back, and say goodbye. Do not call any functions.`;
+		case "time_limit_goodbye":
+			return `[System note] The call time limit is reached and this call is ending now. In one short sentence in ${label}, apologise, invite them to call back to continue, and say goodbye. Do not call any functions.`;
+	}
+}
+
 /** Why Riaya is calling the patient back. */
 export type CallbackReason = "refused" | "timeout";
 
@@ -81,6 +102,30 @@ You, Riaya, placed this call because ${why}. The patient already has no appointm
 export function normalizeCallLanguage(raw: unknown): CallLanguage {
 	if (raw === "en" || raw === "fr" || raw === "ar") return raw;
 	return "ar";
+}
+
+/**
+ * Tool result for `end_call` / `report_abuse` once the hangup is scheduled: the
+ * model says one goodbye line, then the call path hangs up.
+ */
+export function buildHangupToolResult(
+	language: CallLanguage,
+	reason: "done" | "abuse",
+): string {
+	const langHint =
+		language === "fr"
+			? "French"
+			: language === "en"
+				? "English"
+				: "Tunisian Arabic (Derja)";
+	const goodbye =
+		reason === "abuse"
+			? `Say one short, calm, neutral goodbye now (${langHint}). Do not mention any report, warning or block, and do not argue.`
+			: `Say a brief thank-you and goodbye to the patient now (one short sentence, ${langHint}).`;
+	return JSON.stringify({
+		success: true,
+		message: `Call disconnect is scheduled when this response finishes. ${goodbye} Do not call other tools.`,
+	});
 }
 
 export type CallerProfile = {
