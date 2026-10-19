@@ -2,6 +2,7 @@
 
 import type { CallerRefusalContext } from "../api/callerAppointmentsApi.js";
 import type { PersonOnLine } from "../api/callerPeopleApi.js";
+import type { CallerPlace } from "../api/callerPlaceApi.js";
 
 export type CallLanguage = "en" | "fr" | "ar";
 
@@ -138,6 +139,8 @@ export type CallerProfile = {
 	refusalContext?: CallerRefusalContext | null;
 	/** Set when Riaya placed the call (outbound callback). */
 	callbackReason?: CallbackReason | null;
+	/** Place of this line's last phone booking, offered again at the location step. */
+	lastPlace?: CallerPlace | null;
 };
 
 function buildRefusalBlock(
@@ -193,6 +196,16 @@ const RELATIONSHIP_LABEL: Record<PersonOnLine["relationship"], string> = {
 	other: "family member of the phone owner",
 };
 
+function buildLastPlaceBlock(place: CallerPlace | null | undefined): string {
+	// Without a name the assistant cannot ask about it, so it asks for the place as usual.
+	if (!place?.label) return "";
+	return `
+
+## LAST BOOKING PLACE
+This line last booked from near **${place.label}** (latitude ${place.latitude}, longitude ${place.longitude}).
+At the location step, ask once whether the patient is in the same area as last time, naming the place. If yes, use these coordinates for \`find_available_slots\` or \`book_emergency_appointments\` and skip \`search_location\`. If no, ask for the place as usual. Do not mention it in the opening greeting.`;
+}
+
 function buildPeopleBlock(people: PersonOnLine[]): string {
 	if (people.length === 0) return "";
 	const lines = people
@@ -235,7 +248,7 @@ If they ask to speak a language **different from ${lang}** (English, French, or 
 		? buildCallbackBlock(profile.callbackReason)
 		: "";
 	if (!profile.callerPhone) return `${instructions}${callback}`;
-	const withPhone = `${instructions}${callback}${buildPeopleBlock(profile.people ?? [])}
+	const withPhone = `${instructions}${callback}${buildPeopleBlock(profile.people ?? [])}${buildLastPlaceBlock(profile.lastPlace)}
 
 ## CALLER PHONE (THIS LINE)
 The phone number for this call is: **${profile.callerPhone}**.

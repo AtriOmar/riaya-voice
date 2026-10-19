@@ -9,6 +9,7 @@ import {
 	ownerOnly,
 	type PersonOnLine,
 } from "../api/callerPeopleApi.js";
+import { type CallerPlace, getCallerLastPlace } from "../api/callerPlaceApi.js";
 import { createCallEvent, ensureCallRow, updateCall } from "../api/callsApi.js";
 import { ensurePersonRow } from "../api/personsApi.js";
 import { getTwilioClient } from "../api/twilioClient.js";
@@ -85,6 +86,8 @@ export class TwilioSession {
 	private refusalContext: CallerRefusalContext | null = null;
 	/** Everyone on the caller's phone, for "who is this appointment for?". */
 	private peopleOnLine: PersonOnLine[] = [];
+	/** Place of this line's last phone booking (offered again at the location step). */
+	private lastPlace: CallerPlace | null = null;
 
 	/** DB id of the person record for this caller (set once callerPhone is known). */
 	private personId: number | null = null;
@@ -232,6 +235,9 @@ export class TwilioSession {
 			get personId() {
 				return session.personId;
 			},
+			get lastPlace() {
+				return session.lastPlace;
+			},
 			applyPersonRow: (row) => this.applyPersonRow(row),
 			onProfileChange: ({ firstName, preferredLanguage }) => {
 				if (firstName) this.callerFirstName = firstName;
@@ -279,6 +285,7 @@ export class TwilioSession {
 			people: this.peopleOnLine,
 			refusalContext: this.refusalContext,
 			callbackReason: this.callbackReason,
+			lastPlace: this.lastPlace,
 		});
 	}
 
@@ -484,8 +491,10 @@ export class TwilioSession {
 							ensurePersonRow(this.callerPhone),
 							getCallerRefusalContext(this.callerPhone),
 							getPeopleOnLine(this.callerPhone),
-						]).then(([row, refusalContext, people]) => {
+							getCallerLastPlace(this.callerPhone),
+						]).then(([row, refusalContext, people, lastPlace]) => {
 							this.refusalContext = refusalContext;
+							this.lastPlace = lastPlace;
 							this.peopleOnLine =
 								people.length > 0 ? people : row ? ownerOnly(row) : [];
 							if (row != null) {

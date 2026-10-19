@@ -6,6 +6,7 @@ import {
 	listCallerAiAppointments,
 } from "../api/callerAppointmentsApi.js";
 import type { PersonRelationship } from "../api/callerPeopleApi.js";
+import type { CallerPlace } from "../api/callerPlaceApi.js";
 import type { createCallEvent, updateCall } from "../api/callsApi.js";
 import { nextjsApi } from "../api/nextjsApiClient.js";
 import { ensurePersonRow, updatePersonRow } from "../api/personsApi.js";
@@ -38,6 +39,8 @@ export interface CallToolsContext {
 	readonly callSid: string | null;
 	readonly callerPhone: string | null;
 	readonly personId: number | null;
+	/** Place of this line's last phone booking, offered again at the location step. */
+	readonly lastPlace: CallerPlace | null;
 	applyPersonRow(row: PersonRow): void;
 	onProfileChange(change: {
 		firstName?: string;
@@ -49,6 +52,11 @@ export interface CallToolsContext {
 }
 
 const CITY_SEARCH_RADIUS_M = 30_000;
+
+/** Coordinates rounded to about 10 m, so the same place matches even if the model rounds them. */
+function placeKey(latitude: number, longitude: number): string {
+	return `${latitude.toFixed(4)},${longitude.toFixed(4)}`;
+}
 
 /** Row from `GET /api/internal/places/search` (see web `lib/geo`). */
 type PlaceSearchResult = {
@@ -455,7 +463,26 @@ function normalizeCancelAppointmentArgs(
 // ==================== CallTools ====================
 
 export class CallTools {
+	/** Names of the places `search_location` returned on this call, by coordinates. */
+	private readonly placeLabels = new Map<string, string>();
+	/** The place of the last doctor search, saved on the booking. */
+	private searchPlace: CallerPlace | null = null;
+
 	constructor(private readonly ctx: CallToolsContext) {}
+
+	/** The place at these coordinates, named when it came from a search, the last booking or the city list. */
+	private placeAt(latitude: number, longitude: number): CallerPlace {
+		const key = placeKey(latitude, longitude);
+		const last = this.ctx.lastPlace;
+		const label =
+			this.placeLabels.get(key) ??
+			(last && placeKey(last.latitude, last.longitude) === key
+				? last.label
+				: null) ??
+			CITIES.find((c) => placeKey(c.latitude, c.longitude) === key)?.en_name ??
+			null;
+		return { label, latitude, longitude };
+	}
 
 	/** Runs one tool (everything except `end_call`) and returns the JSON string fed back to the model. */
 	async run(
@@ -673,6 +700,11 @@ export class CallTools {
 				});
 			}
 
+			for (const p of places) {
+				if (p.lat !== null && p.lng !== null)
+					this.placeLabels.set(placeKey(p.lat, p.lng), p.label);
+			}
+
 			const results = places.map((p) => ({
 				name: p.label,
 				city: p.city,
@@ -705,6 +737,7 @@ export class CallTools {
 		longitude: number;
 		preferredTime?: string;
 	}): Promise<string> {
+		this.searchPlace = this.placeAt(params.latitude, params.longitude);
 		const path = "/api/doctors/best-fit";
 		// Next route expects query keys: speciality, lat, long, time
 		const query = {
@@ -1065,6 +1098,15 @@ export class CallTools {
 			illness: params.illness,
 			start: params.start,
 			end: params.end,
+			...(this.searchPlace
+				? {
+						patientPlace: {
+							label: this.searchPlace.label,
+							lat: this.searchPlace.latitude,
+							long: this.searchPlace.longitude,
+						},
+					}
+				: {}),
 		};
 
 		const bookPath = "/api/appointments/external";
@@ -1151,6 +1193,7 @@ export class CallTools {
 			speciality: params.specialitySlug,
 			lat: params.latitude,
 			long: params.longitude,
+			placeLabel: this.placeAt(params.latitude, params.longitude).label,
 			phoneNumber: callerRaw,
 			patient: params.patient,
 			illness: params.illness,

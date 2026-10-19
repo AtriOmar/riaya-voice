@@ -24,6 +24,7 @@ import {
 	ownerOnly,
 	type PersonOnLine,
 } from "../api/callerPeopleApi.js";
+import { type CallerPlace, getCallerLastPlace } from "../api/callerPlaceApi.js";
 import { createCallEvent, ensureCallRow, updateCall } from "../api/callsApi.js";
 import { ensurePersonRow } from "../api/personsApi.js";
 import { CITIES } from "../constants/cities.js";
@@ -439,14 +440,17 @@ export default defineAgent({
 		};
 		let refusalContext: CallerRefusalContext | null = null;
 		let people: PersonOnLine[] = [];
+		let lastPlace: CallerPlace | null = null;
 		if (callerPhone) {
-			const [row, refusal, onLine] = await Promise.all([
+			const [row, refusal, onLine, place] = await Promise.all([
 				ensurePersonRow(callerPhone),
 				getCallerRefusalContext(callerPhone),
 				getPeopleOnLine(callerPhone),
+				getCallerLastPlace(callerPhone),
 			]);
 			if (row) applyPersonRow(row);
 			refusalContext = refusal;
+			lastPlace = place;
 			people = onLine.length > 0 ? onLine : row ? ownerOnly(row) : [];
 		}
 
@@ -457,6 +461,7 @@ export default defineAgent({
 				callerPhone,
 				people,
 				refusalContext,
+				lastPlace,
 			}) + (PROFILE_CAPTURE === "background" ? PROFILE_CAPTURE_NOTE : "");
 
 		// ---------- pipeline ----------
@@ -607,6 +612,7 @@ export default defineAgent({
 			get personId() {
 				return personId;
 			},
+			lastPlace,
 			applyPersonRow,
 			onProfileChange: (change) => {
 				if (change.firstName) firstName = change.firstName;

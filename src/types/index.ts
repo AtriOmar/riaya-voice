@@ -183,6 +183,8 @@ export type BookAppointmentParams = {
 	illness: string;
 	start: string;
 	end: string;
+	/** Where the patient searched from; kept on the booking for the next call. */
+	patientPlace?: { label: string | null; lat: number; long: number };
 };
 
 export type FindSlotsParams = {
