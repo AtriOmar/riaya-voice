@@ -169,7 +169,7 @@ type FindDoctorSlotsArgs = {
 	limit?: number;
 };
 
-/** Who a booking is for: someone on the line (`personId`) or a new family member. */
+/** Who a booking is for: someone on the line (`personId`), a new family member, or (neither) the phone owner. */
 type BookingPatient = {
 	personId?: number;
 	firstName: string;
@@ -207,8 +207,9 @@ function bookingPatientName(p: BookingPatient): string {
 }
 
 /**
- * Read the `patient_*` tool arguments. Needs a first name, plus either
- * `patient_person_id` (someone on the line) or `patient_relationship` (new family member).
+ * Read the `patient_*` tool arguments. Needs a first name. `patient_person_id` picks
+ * someone on the line, `patient_relationship` adds a new family member, and with
+ * neither the booking is for the phone owner.
  */
 function parseBookingPatient(
 	o: Record<string, unknown>,
@@ -233,6 +234,7 @@ function parseBookingPatient(
 		"patient_relationship",
 		"patientRelationship",
 	);
+	if (relationship === undefined) return { firstName, lastName };
 	const family = FAMILY_RELATIONSHIPS.find((r) => r === relationship);
 	if (!family) return null;
 	return { firstName, lastName, relationship: family };
@@ -557,7 +559,7 @@ export class CallTools {
 					result = JSON.stringify({
 						error: true,
 						message:
-							"book_appointment: invalid arguments (expected doctor_id, patient_name, illness, start, end)",
+							"book_appointment: invalid arguments (expected doctor_id, patient_first_name, illness, start, end)",
 					});
 					break;
 				}
@@ -571,7 +573,7 @@ export class CallTools {
 					result = JSON.stringify({
 						error: true,
 						message:
-							"book_emergency_appointments: invalid arguments (expected speciality_slug, latitude, longitude, patient_name, illness)",
+							"book_emergency_appointments: invalid arguments (expected speciality_slug, latitude, longitude, patient_first_name, illness)",
 					});
 					break;
 				}

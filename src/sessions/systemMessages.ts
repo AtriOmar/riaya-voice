@@ -9,7 +9,7 @@ const PATIENT_PARAMETERS = {
 	patient_person_id: {
 		type: "integer",
 		description:
-			"The patient's person id from PEOPLE ON THIS LINE (or from an earlier booking result on this call). Omit only for a new family member.",
+			"The patient's person id from PEOPLE ON THIS LINE (or from an earlier booking result on this call). Omit for the phone owner who is not listed yet, or for a new family member.",
 	},
 	patient_first_name: {
 		type: "string",
