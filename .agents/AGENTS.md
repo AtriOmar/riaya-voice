@@ -235,7 +235,7 @@ Use these as examples before changing related code.
 - `find_available_slots`, `find_doctor_slots` — Next doctor/slot APIs.
 - `update_person_info` — `PATCH /api/persons/[id]` via `updatePersonRow`; name, language preference, etc.
 - `list_my_ai_appointments` / `cancel_appointment` — `callerAppointmentsApi.ts` → internal Next routes; **phone from `this.callerPhone` only** (never tool args). Cancel **pending** AI bookings only; confirmed → patient contacts doctor.
-- `book_appointment` — `POST /api/appointments/external`. Tool args: `doctor_id`, `patient_name`, `illness`, `start`, `end` only. **Phone is not an AI parameter**; `bookAppointment()` sends `this.callerPhone` server-side.
+- `book_appointment` — `POST /api/appointments/external`. Tool args: `doctor_id`, `patient_first_name`, optional `patient_last_name` / `patient_person_id` / `patient_relationship` (neither id nor relationship = the phone owner), `illness`, `start`, `end`. **Phone is not an AI parameter**; `bookAppointment()` sends `this.callerPhone` server-side.
 - `end_call` — schedules disconnect; assistant says a brief thank-you/goodbye, then hangup after playback.
 
 Person row from `ensurePersonRow` drives greeting first name + `preferredLanguage` in session instructions. Do not mention appointments in opening greeting.
