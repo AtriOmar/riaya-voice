@@ -60,3 +60,6 @@ coverage/
 
 # WhatsApp authentication state
 whatsapp-auth/
+
+# Playwright MCP session output
+.playwright-mcp/

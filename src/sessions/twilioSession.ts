@@ -1,455 +1,73 @@
-import { DefaultAzureCredential } from "@azure/identity";
-import axios from "axios";
 import type { Logger } from "pino";
-import twilio from "twilio";
 import { type RawData, WebSocket } from "ws";
 import {
-	cancelCallerAiAppointment,
-	listCallerAiAppointments,
+	type CallerRefusalContext,
+	getCallerRefusalContext,
 } from "../api/callerAppointmentsApi.js";
+import {
+	getPeopleOnLine,
+	ownerOnly,
+	type PersonOnLine,
+} from "../api/callerPeopleApi.js";
+import { type CallerPlace, getCallerLastPlace } from "../api/callerPlaceApi.js";
 import { createCallEvent, ensureCallRow, updateCall } from "../api/callsApi.js";
-import { nextjsApi } from "../api/nextjsApiClient.js";
-import { ensurePersonRow, updatePersonRow } from "../api/personsApi.js";
-import { CITIES } from "../constants/cities.js";
-import { SPECIALITIES } from "../constants/specialities.js";
+import { ensurePersonRow } from "../api/personsApi.js";
+import { getTwilioClient } from "../api/twilioClient.js";
+import {
+	createRealtimeProvider,
+	type RealtimeFunctionCall,
+	type RealtimeProvider,
+} from "../realtime/index.js";
+import type { RealtimeHandlers } from "../realtime/types.js";
+import {
+	type CallSettings,
+	loadCallSettings,
+} from "../settings/callSettings.js";
+import {
+	CallTools,
+	consoleLogToolHttpError,
+	toolFailureMessage,
+	truncateForLog,
+} from "../tools/callTools.js";
 import type {
-	BestFitDoctor,
-	BookAppointmentParams,
 	DashboardMessage,
-	DoctorAvailabilityResponse,
 	SystemMessage,
 	TwilioMediaMessage,
 } from "../types/index.js";
+import { CallerTranscriber } from "./callerTranscriber.js";
+import {
+	buildCallbackGreetingInstructions,
+	buildCallInstructions,
+	buildHangupToolResult,
+	buildInitialGreetingInstructions,
+	buildWatchdogInstructions,
+	type CallbackReason,
+	type CallLanguage,
+	normalizeCallbackReason,
+	normalizeCallLanguage,
+	type WatchdogPrompt,
+} from "./callInstructions.js";
+import { CallerVoiceDetector, CallWatchdog } from "./callWatchdog.js";
 
-const {
-	BACKEND,
-	OPENAI_API_KEY,
-	OPENAI_ENDPOINT,
-	OPENAI_MODEL,
-	OPENAI_API_VERSION,
-} = process.env as Record<string, string>;
-
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-
-let twilioRestClient: ReturnType<typeof twilio> | null = null;
-
-function getTwilioRestClient(): ReturnType<typeof twilio> | null {
-	if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return null;
-	if (!twilioRestClient) {
-		twilioRestClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-	}
-	return twilioRestClient;
+function getTwilioRestClient() {
+	return getTwilioClient();
 }
-
-// ==================== Session Config ====================
-
-const SESSION_CONFIG = {
-	modalities: ["text", "audio"],
-	voice: "ash",
-	input_audio_format: "g711_ulaw",
-	output_audio_format: "g711_ulaw",
-	input_audio_transcription: {
-		model: process.env.INPUT_TRANSCRIPTION_MODEL?.trim() || "gpt-4o-transcribe",
-		prompt:
-			"The audio may be in Tunisian Arabic (Tunisian Derja), English, or French — transcribe in whatever language the caller uses; do not translate to another language. " +
-			"Context: patients calling Riaya, a healthcare platform in Tunisia, to book doctor appointments by phone. " +
-			"Expect symptoms and reasons for visit; medical speciality names; Tunisian city and neighborhood names; doctor and clinic (cabinet) names; " +
-			"dates and times patients mention (often Tunisia local time, GMT+1); booking and confirmation phrases; phone numbers and people's names.",
-	},
-	turn_detection: {
-		type: "server_vad",
-		threshold: parseFloat(process.env.VAD_THRESHOLD || "0.5"),
-		silence_duration_ms: parseInt(process.env.SILENCE_DURATION_MS || "600", 10),
-	},
-	tool_choice: "auto",
-	max_response_output_tokens: parseInt(
-		process.env.MAX_OUTPUT_TOKENS || "4096",
-		10,
-	),
-};
-
-type CallLanguage = "en" | "fr" | "ar";
-
-function buildInitialGreetingInstructions(
-	lang: CallLanguage,
-	firstName?: string | null,
-): string {
-	const name = firstName?.trim();
-	const withName = name && name.length > 0;
-	if (lang === "fr") {
-		return withName
-			? `Say exactly one short sentence in French greeting ${name} by first name, introduce yourself as Riaya, and ask how you can help. Do NOT mention appointments. Do NOT call any functions.`
-			: 'Say exactly one short sentence in French: "Bonjour, ici Riaya. Comment puis-je vous aider?" Do NOT call any functions.';
-	}
-	if (lang === "ar") {
-		return withName
-			? `Say exactly one short sentence in Tunisian Arabic (Derja): "أهلا ${name}، معاك رعاية. شنوّا نجم نعاونك?" Do NOT mention appointments. Do NOT call any functions.`
-			: 'Say exactly one short sentence in Tunisian Arabic (Derja): "أهلا، معاك رعاية. شنوّا نجم نعاونك?" Do NOT call any functions.';
-	}
-	return withName
-		? `Say exactly one short sentence greeting ${name} by first name, say "Hello, this is Riaya," and ask how you can help. Do NOT mention appointments. Do NOT call any functions.`
-		: 'Say exactly one short sentence: "Hello, this is Riaya. How can I help you?" Do NOT call any functions.';
-}
-
-function normalizeCallLanguage(raw: unknown): CallLanguage {
-	if (raw === "en" || raw === "fr" || raw === "ar") return raw;
-	return "ar";
-}
-
-// ==================== Tool / HTTP logging ====================
-
-const MAX_LOG_CHARS = 8000;
-
-function truncateForLog(value: string, max = MAX_LOG_CHARS): string {
-	if (value.length <= max) return value;
-	return `${value.slice(0, max)}…[truncated, ${value.length} chars total]`;
-}
-
-function tryParseJsonString(raw: string): unknown {
-	try {
-		return JSON.parse(raw);
-	} catch {
-		return undefined;
-	}
-}
-
-function bodyFromAxiosConfig(data: unknown): unknown {
-	if (data == null) return data;
-	if (typeof data === "string") return tryParseJsonString(data) ?? data;
-	return data;
-}
-
-function consoleLogToolHttpError(
-	tool: string,
-	ctx: { callSid?: string | null; call_id?: string; input?: unknown },
-	error: unknown,
-): void {
-	console.log("---------------------- TOOL HTTP ERROR ----------------------");
-	console.log("tool:", tool);
-	console.log("callSid:", ctx.callSid);
-	console.log("call_id:", ctx.call_id);
-	console.log("input:", JSON.stringify(ctx.input, null, 2));
-	if (axios.isAxiosError(error)) {
-		console.log("axiosMessage:", error.message);
-		console.log("axiosCode:", error.code);
-		console.log(
-			"httpStatus:",
-			error.response?.status,
-			error.response?.statusText,
-		);
-		console.log("responseData:", error.response?.data);
-		console.log("requestUrl:", error.config?.url);
-		console.log("requestMethod:", error.config?.method);
-		console.log("requestParams:", error.config?.params);
-		console.log("requestBody:", bodyFromAxiosConfig(error.config?.data));
-	} else {
-		console.log("non-axios error:", error);
-	}
-	console.log("-------------------------------------------------------------");
-}
-
-function toolFailureMessage(tool: string, error: unknown): string {
-	if (axios.isAxiosError(error)) {
-		const status = error.response?.status;
-		const data = error.response?.data;
-		const detail =
-			data === undefined || data === null
-				? ""
-				: typeof data === "string"
-					? truncateForLog(data, 2500)
-					: truncateForLog(JSON.stringify(data), 2500);
-		const suffix = detail ? ` — ${detail}` : "";
-		return `${tool}: HTTP ${String(status ?? "?")} ${error.message}${suffix}`;
-	}
-	if (error instanceof Error) return `${tool}: ${error.message}`;
-	return `${tool}: ${String(error)}`;
-}
-
-type FindAvailableSlotsArgs = {
-	specialitySlug: string;
-	latitude: number;
-	longitude: number;
-	preferredTime?: string;
-};
-
-type FindDoctorSlotsArgs = {
-	doctorId: number;
-	preferredTime?: string;
-	limit?: number;
-};
-
-type BookAppointmentToolArgs = {
-	doctorId: number | string;
-	patientName: string;
-	illness: string;
-	start: string;
-	end: string;
-};
-
-type BookEmergencyAppointmentsToolArgs = {
-	specialitySlug: string;
-	latitude: number;
-	longitude: number;
-	patientName: string;
-	illness: string;
-};
-
-function phoneDigitsOnly(raw: string): string {
-	return raw.replace(/\D/g, "");
-}
-
-type UpdatePersonInfoToolArgs = {
-	firstName?: string;
-	lastName?: string;
-	dateOfBirth?: string;
-	gender?: string;
-	address?: string;
-	preferredLanguage?: CallLanguage;
-};
-
-function strField(
-	raw: Record<string, unknown>,
-	snake: string,
-	camel: string,
-): string | undefined {
-	const a = raw[snake];
-	const b = raw[camel];
-	if (typeof a === "string" && a.length > 0) return a;
-	if (typeof b === "string" && b.length > 0) return b;
-	return undefined;
-}
-
-function numField(
-	raw: Record<string, unknown>,
-	snake: string,
-	camel: string,
-): number | undefined {
-	const a = raw[snake];
-	const b = raw[camel];
-	for (const v of [a, b]) {
-		if (typeof v === "number" && Number.isFinite(v)) return v;
-	}
-	return undefined;
-}
-
-/** Accepts snake_case (tool schema) or legacy camelCase; maps to internal shape for HTTP. */
-function normalizeFindAvailableSlotsArgs(
-	raw: unknown,
-): FindAvailableSlotsArgs | null {
-	if (raw === null || typeof raw !== "object" || Array.isArray(raw))
-		return null;
-	const o = raw as Record<string, unknown>;
-	const specialitySlug = strField(o, "speciality_slug", "specialitySlug") ?? "";
-	const latitude = numField(o, "latitude", "latitude");
-	const longitude = numField(o, "longitude", "longitude");
-	const preferredTime = strField(o, "preferred_time", "preferredTime");
-	if (latitude === undefined || longitude === undefined) return null;
-	return {
-		specialitySlug,
-		latitude,
-		longitude,
-		...(preferredTime !== undefined ? { preferredTime } : {}),
-	};
-}
-
-/** Accepts snake_case (tool schema) or legacy camelCase; maps to internal shape for HTTP. */
-function normalizeFindDoctorSlotsArgs(
-	raw: unknown,
-): FindDoctorSlotsArgs | null {
-	if (raw === null || typeof raw !== "object" || Array.isArray(raw))
-		return null;
-	const o = raw as Record<string, unknown>;
-	const doctorIdRaw = o.doctor_id ?? o.doctorId;
-	const preferredTime = strField(o, "preferred_time", "preferredTime");
-	const limitRaw = o.limit;
-
-	let doctorId: number | null = null;
-	if (typeof doctorIdRaw === "number") doctorId = doctorIdRaw;
-	if (typeof doctorIdRaw === "string" && doctorIdRaw.trim() !== "") {
-		const parsed = Number(doctorIdRaw);
-		if (Number.isFinite(parsed)) doctorId = parsed;
-	}
-	if (
-		doctorId === null ||
-		!Number.isInteger(doctorId) ||
-		!Number.isFinite(doctorId) ||
-		doctorId <= 0
-	) {
-		return null;
-	}
-
-	let limit: number | undefined;
-	if (typeof limitRaw === "number" && Number.isFinite(limitRaw)) {
-		limit = Math.max(1, Math.min(10, Math.floor(limitRaw)));
-	}
-	if (typeof limitRaw === "string" && limitRaw.trim() !== "") {
-		const parsed = Number(limitRaw);
-		if (Number.isFinite(parsed)) {
-			limit = Math.max(1, Math.min(10, Math.floor(parsed)));
-		}
-	}
-
-	return {
-		doctorId,
-		...(preferredTime !== undefined ? { preferredTime } : {}),
-		...(limit !== undefined ? { limit } : {}),
-	};
-}
-
-/** Accepts snake_case (tool schema) or legacy camelCase; maps to internal shape for HTTP. */
-function normalizeBookAppointmentArgs(
-	raw: unknown,
-): BookAppointmentToolArgs | null {
-	if (raw === null || typeof raw !== "object" || Array.isArray(raw))
-		return null;
-	const o = raw as Record<string, unknown>;
-	const doctorId = o.doctor_id ?? o.doctorId;
-	const patientName = strField(o, "patient_name", "patientName");
-	const illness = strField(o, "illness", "illness");
-	const start = strField(o, "start", "start");
-	const end = strField(o, "end", "end");
-	if (
-		patientName === undefined ||
-		illness === undefined ||
-		start === undefined ||
-		end === undefined
-	) {
-		return null;
-	}
-	return {
-		doctorId: doctorId as number | string,
-		patientName,
-		illness,
-		start,
-		end,
-	};
-}
-
-function normalizeBookEmergencyAppointmentsArgs(
-	raw: unknown,
-): BookEmergencyAppointmentsToolArgs | null {
-	if (raw === null || typeof raw !== "object" || Array.isArray(raw))
-		return null;
-	const o = raw as Record<string, unknown>;
-	const specialitySlug = strField(o, "speciality_slug", "specialitySlug");
-	const latitude = numField(o, "latitude", "latitude");
-	const longitude = numField(o, "longitude", "longitude");
-	const patientName = strField(o, "patient_name", "patientName");
-	const illness = strField(o, "illness", "illness");
-	if (
-		specialitySlug === undefined ||
-		latitude === undefined ||
-		longitude === undefined ||
-		patientName === undefined ||
-		illness === undefined
-	) {
-		return null;
-	}
-	return { specialitySlug, latitude, longitude, patientName, illness };
-}
-
-/** Accepts snake_case (tool schema) or legacy camelCase; maps to internal shape for HTTP. */
-function normalizeUpdatePersonInfoArgs(
-	raw: unknown,
-): UpdatePersonInfoToolArgs | null {
-	if (raw === null || typeof raw !== "object" || Array.isArray(raw))
-		return null;
-	const o = raw as Record<string, unknown>;
-	const firstName = strField(o, "first_name", "firstName");
-	const lastName = strField(o, "last_name", "lastName");
-	const dateOfBirth = strField(o, "date_of_birth", "dateOfBirth");
-	const gender = strField(o, "gender", "gender");
-	const address = strField(o, "address", "address");
-	const preferredLanguageRaw = strField(
-		o,
-		"preferred_language",
-		"preferredLanguage",
-	);
-	const preferredLanguage =
-		preferredLanguageRaw === "en" ||
-		preferredLanguageRaw === "fr" ||
-		preferredLanguageRaw === "ar"
-			? preferredLanguageRaw
-			: undefined;
-
-	if (
-		firstName === undefined &&
-		lastName === undefined &&
-		dateOfBirth === undefined &&
-		gender === undefined &&
-		address === undefined &&
-		preferredLanguage === undefined
-	) {
-		return null;
-	}
-
-	return {
-		...(firstName !== undefined ? { firstName } : {}),
-		...(lastName !== undefined ? { lastName } : {}),
-		...(dateOfBirth !== undefined ? { dateOfBirth } : {}),
-		...(gender !== undefined ? { gender } : {}),
-		...(address !== undefined ? { address } : {}),
-		...(preferredLanguage !== undefined ? { preferredLanguage } : {}),
-	};
-}
-
-function normalizeCancelAppointmentArgs(
-	raw: unknown,
-): { appointmentId: number } | null {
-	if (raw === null || typeof raw !== "object" || Array.isArray(raw))
-		return null;
-	const o = raw as Record<string, unknown>;
-	const idRaw = o.appointment_id ?? o.appointmentId;
-	let appointmentId: number | null = null;
-	if (typeof idRaw === "number") appointmentId = idRaw;
-	if (typeof idRaw === "string" && idRaw.trim() !== "") {
-		const parsed = Number(idRaw);
-		if (Number.isFinite(parsed)) appointmentId = parsed;
-	}
-	if (
-		appointmentId === null ||
-		!Number.isInteger(appointmentId) ||
-		appointmentId <= 0
-	) {
-		return null;
-	}
-	return { appointmentId };
-}
-
-// ==================== OpenAI Realtime Event Types ====================
-
-const EVENTS = {
-	SessionCreated: "session.created",
-	SessionUpdated: "session.updated",
-	InputAudioBufferSpeechStarted: "input_audio_buffer.speech_started",
-	InputAudioBufferSpeechStopped: "input_audio_buffer.speech_stopped",
-	InputAudioBufferCommitted: "input_audio_buffer.committed",
-	ResponseAudioDelta: "response.audio.delta",
-	ResponseAudioDone: "response.audio.done",
-	ResponseAudioTranscriptDelta: "response.audio_transcript.delta",
-	ResponseAudioTranscriptDone: "response.audio_transcript.done",
-	ResponseFunctionCallArgumentsDone: "response.function_call_arguments.done",
-	ResponseDone: "response.done",
-	Error: "error",
-	ConversationItemCreated: "conversation.item.created",
-	ConversationItemInputAudioTranscriptionCompleted:
-		"conversation.item.input_audio_transcription.completed",
-	ConversationItemInputAudioTranscriptionFailed:
-		"conversation.item.input_audio_transcription.failed",
-	RateLimitsUpdated: "rate_limits.updated",
-	ResponseOutputItemDone: "response.output_item.done",
-};
 
 // ==================== TwilioSession ====================
 
 export class TwilioSession {
-	// Azure auth token cache (shared across sessions)
-	private static tokenCache: { token: string; expires: number } | null = null;
-	private static readonly TOKEN_REFRESH_THRESHOLD_MS = 5 * 60 * 1000;
-
 	// Connection state
-	private openAIWs!: WebSocket;
+	private provider: RealtimeProvider | null = null;
+	private readonly tools: CallTools;
+	/** Ends silent calls and caps call length. */
+	private readonly watchdog: CallWatchdog;
+	private readonly voiceDetector = new CallerVoiceDetector(() =>
+		this.watchdog.callerSpoke(),
+	);
+	/** Separate caller transcription; null when CALLER_STT=off (use the realtime model's transcript). */
+	private callerTranscriber: CallerTranscriber | null = null;
+	/** Provider connection is open and can accept `start()`. */
+	private providerReady = false;
 	private streamSid: string | null = null;
 	private callSid: string | null = null;
 
@@ -464,11 +82,17 @@ export class TwilioSession {
 
 	/** E.164 (or Twilio-provided) caller ID from Stream customParameters */
 	private callerPhone: string | null = null;
+	/** Alternatives to offer when a doctor refused this caller's last request. */
+	private refusalContext: CallerRefusalContext | null = null;
+	/** Everyone on the caller's phone, for "who is this appointment for?". */
+	private peopleOnLine: PersonOnLine[] = [];
+	/** Place of this line's last phone booking (offered again at the location step). */
+	private lastPlace: CallerPlace | null = null;
 
 	/** DB id of the person record for this caller (set once callerPhone is known). */
 	private personId: number | null = null;
 
-	/** Only the first session.update should trigger the opening greeting */
+	/** Session has been started (config + opening greeting sent) */
 	private initialGreetingSent = false;
 	/** Twilio media `start` received — callerPhone / person lookup may still be in flight. */
 	private twilioStreamStarted = false;
@@ -486,8 +110,12 @@ export class TwilioSession {
 	private hangupScheduled = false;
 	/** `end_call` was invoked; hang up after the assistant goodbye response finishes. */
 	private pendingHangup = false;
-	/** Ignore the next `response.done` (the turn that invoked `end_call`); hang up after the following one. */
-	private skipNextResponseDoneForEndCall = false;
+	/**
+	 * AI audio arrived after the `end_call` result was sent, i.e. the goodbye is
+	 * being spoken. The response that merely invoked `end_call` (no audio after
+	 * the result) must not trigger the hangup.
+	 */
+	private goodbyeAudioStarted = false;
 	/** Goodbye audio has finished generating; hang up once Twilio marks drain. */
 	private hangupAfterPlayback = false;
 	private hangupTimer: ReturnType<typeof setTimeout> | null = null;
@@ -501,16 +129,125 @@ export class TwilioSession {
 	 */
 	private isSimulated = false;
 
+	/** Set when Riaya placed the call (real Twilio callback or test-call page). */
+	private callbackReason: CallbackReason | null = null;
+
 	constructor(
 		private readonly twilioWs: WebSocket,
 		private readonly logger: Logger,
 		private readonly systemMessage: SystemMessage,
 		private readonly dashboardClients: Set<WebSocket>,
+		/** Test-call page only: call id whose per-call model settings live in Redis. */
+		private readonly settingsSid: string | null = null,
 	) {
 		this.logger.info("🟢 TwilioSession created");
+		this.tools = this.createTools();
+		this.watchdog = new CallWatchdog(this.logger, {
+			onAskStillThere: () => this.promptAssistant("still_there"),
+			onSilentGoodbye: () =>
+				this.endWithGoodbye(
+					"silent_goodbye",
+					"Call ended: the caller stayed silent.",
+				),
+			onTimeLimit: () =>
+				this.endWithGoodbye(
+					"time_limit_goodbye",
+					"Call ended: the call time limit was reached.",
+				),
+		});
 		this.initialize().catch((error) =>
 			this.logger.error({ error }, "🔥 Failed to initialize TwilioSession"),
 		);
+	}
+
+	private realtimeHandlers(): RealtimeHandlers {
+		return {
+			onReady: () => {
+				this.providerReady = true;
+				this.trySendInitialGreeting();
+			},
+			onAudio: (payload, itemId) => this.handleAudioDelta(payload, itemId),
+			onAiTranscriptDelta: (delta) => this.handleAiTranscriptDelta(delta),
+			onAiTranscriptDone: (text) => this.handleAiTranscriptDone(text),
+			onPatientTranscript: (text) => {
+				// With a separate transcriber, the realtime model's own transcript is skipped.
+				if (!this.callerTranscriber) this.handlePatientTranscript(text);
+			},
+			onSpeechStarted: () => this.handleSpeechStarted(),
+			onFunctionCall: (call) => {
+				void this.handleFunctionCall(call);
+			},
+			onResponseDone: () => {
+				this.logger.debug("✅ Response complete");
+				this.onResponseDone();
+			},
+			onError: (message, detail) => this.handleProviderError(message, detail),
+			onClose: () => this.dispose(),
+		};
+	}
+
+	private createCallerTranscriber(
+		override?: NonNullable<CallSettings["phone"]>["callerStt"],
+	): CallerTranscriber | null {
+		if (override?.api === "off") return null;
+		const mode = override
+			? override.api === "openrouter-chat"
+				? "openrouter-chat"
+				: "openrouter"
+			: process.env.CALLER_STT?.trim().toLowerCase();
+		if (mode !== "openrouter" && mode !== "openrouter-chat") return null;
+		const apiKey = process.env.OPENROUTER_API_KEY;
+		if (!apiKey) {
+			this.logger.warn(
+				"CALLER_STT=openrouter but OPENROUTER_API_KEY is not set; using the realtime model's transcript",
+			);
+			return null;
+		}
+		const model =
+			override?.model ||
+			process.env.CALLER_STT_MODEL?.trim() ||
+			"google/gemini-3.5-transcribe";
+		this.logger.info({ model }, "🎙️ Separate caller transcription enabled");
+		return new CallerTranscriber({
+			logger: this.logger,
+			apiKey,
+			model,
+			api: mode === "openrouter-chat" ? "chat" : "transcription",
+			reasoningEffort:
+				(override?.reasoning ?? process.env.GEMINI_STT_REASONING?.trim()) ===
+				"none"
+					? "none"
+					: "minimal",
+			onTranscript: (text) => this.handlePatientTranscript(text),
+		});
+	}
+
+	private createTools(): CallTools {
+		const session = this;
+		return new CallTools({
+			logger: this.logger,
+			get callSid() {
+				return session.callSid;
+			},
+			get callerPhone() {
+				return session.callerPhone;
+			},
+			get personId() {
+				return session.personId;
+			},
+			get lastPlace() {
+				return session.lastPlace;
+			},
+			applyPersonRow: (row) => this.applyPersonRow(row),
+			onProfileChange: ({ firstName, preferredLanguage }) => {
+				if (firstName) this.callerFirstName = firstName;
+				if (preferredLanguage) this.callerPreferredLanguage = preferredLanguage;
+				this.sendSessionConfig();
+			},
+			emit: (message) => this.broadcastDashboard(message),
+			persistEvent: (event) => this.persistEvent(event),
+			persistCallUpdate: (update) => this.persistCallUpdate(update),
+		});
 	}
 
 	// ==================== Initialization ====================
@@ -519,100 +256,37 @@ export class TwilioSession {
 		// Set up Twilio handlers FIRST so we don't miss early events (start, connected)
 		// that Twilio sends immediately after the WebSocket is established
 		this.setupTwilioHandlers();
-		this.openAIWs = await this.connectToOpenAI();
-		this.setupOpenAIHandlers();
-	}
-
-	private connectToOpenAI(): Promise<WebSocket> {
-		const url =
-			BACKEND === "azure"
-				? `${OPENAI_ENDPOINT.replace("https://", "wss://")}/openai/realtime?deployment=${OPENAI_MODEL}&api-version=${OPENAI_API_VERSION}`
-				: `wss://api.openai.com/v1/realtime?model=${OPENAI_MODEL || "gpt-4o-realtime-preview"}`;
-
-		this.logger.info(`🔌 Connecting to OpenAI at ${url}`);
-
-		// biome-ignore lint/suspicious/noAsyncPromiseExecutor: I found the code already like this and it seems to be working fine --- IGNORE ---
-		return new Promise(async (resolve, reject) => {
-			const headers = await this.getHeaders();
-			const ws = new WebSocket(url, { headers });
-
-			ws.on("open", () => {
-				this.logger.info("🟢 OpenAI WebSocket connected");
-				resolve(ws);
-			});
-
-			ws.on("error", (error) => {
-				this.logger.error({ error }, "🔥 OpenAI WebSocket connection error");
-				reject(error);
-			});
-		});
-	}
-
-	private async getHeaders(): Promise<Record<string, string>> {
-		if (BACKEND === "azure") {
-			if (OPENAI_API_KEY) {
-				this.logger.info("✅ Using Azure API key");
-				return { "api-key": OPENAI_API_KEY };
-			}
-
-			// Managed identity fallback
-			const now = Date.now();
-			if (
-				TwilioSession.tokenCache &&
-				TwilioSession.tokenCache.expires >
-					now + TwilioSession.TOKEN_REFRESH_THRESHOLD_MS
-			) {
-				return { Authorization: `Bearer ${TwilioSession.tokenCache.token}` };
-			}
-
-			const token = await new DefaultAzureCredential().getToken(
-				"https://cognitiveservices.azure.com/.default",
-			);
-			if (!token?.token)
-				throw new Error("Failed to retrieve Azure access token");
-
-			TwilioSession.tokenCache = {
-				token: token.token,
-				expires: token.expiresOnTimestamp,
-			};
-			return { Authorization: `Bearer ${token.token}` };
-		}
-
-		if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not set");
-		return {
-			Authorization: `Bearer ${OPENAI_API_KEY}`,
-			"OpenAI-Beta": "realtime=v1",
-		};
+		const settings = await loadCallSettings(this.settingsSid, this.logger);
+		this.callerTranscriber = this.createCallerTranscriber(
+			settings?.phone?.callerStt,
+		);
+		const realtime = settings?.phone?.realtime;
+		const provider = createRealtimeProvider(
+			this.logger,
+			this.realtimeHandlers(),
+			realtime
+				? {
+						backend: realtime.backend,
+						model: realtime.model,
+						voice: realtime.voice,
+					}
+				: undefined,
+		);
+		this.provider = provider;
+		this.logger.info(`🔌 Realtime provider: ${provider.name}`);
+		await provider.connect();
 	}
 
 	private buildSessionInstructions(): string {
-		const lang = this.callerPreferredLanguage;
-		const langLabel =
-			lang === "en"
-				? "English"
-				: lang === "fr"
-					? "French"
-					: "Tunisian Arabic (Derja)";
-		const knownName = this.callerFirstName?.trim();
-		const profileBlock = knownName
-			? `Known first name: **${knownName}** (use in greeting; you may skip asking for name unless unclear).`
-			: "Name not on file yet — ask for their name early in the booking flow.";
-		const instructions = `${this.systemMessage.message}
-
-## CALLER PROFILE
-${profileBlock}
-Do **not** mention existing appointments in the opening greeting. Use \`list_my_ai_appointments\` only when the patient asks about a booking, doctor, location, time, or cancellation.
-
-## CALLER LANGUAGE PREFERENCE
-Stored preference for this caller: **${lang}** (${langLabel}). **Start and respond in this language** until the patient asks to switch.
-If they ask to speak another supported language (English, French, or Tunisian Derja), switch immediately and call \`update_person_info\` with \`preferred_language\` set to \`en\`, \`fr\`, or \`ar\` (use \`ar\` for Tunisian Derja).`;
-
-		if (!this.callerPhone) return instructions;
-		return `${instructions}
-
-## CALLER PHONE (THIS LINE)
-The phone number for this call is: **${this.callerPhone}**.
-The server uses this number automatically when \`book_appointment\`, \`list_my_ai_appointments\`, or \`cancel_appointment\` runs. Do **not** ask the patient about their phone number.`;
+		return buildCallInstructions(this.systemMessage.message, {
+			language: this.callerPreferredLanguage,
+			firstName: this.callerFirstName,
+			callerPhone: this.callerPhone,
+			people: this.peopleOnLine,
+			refusalContext: this.refusalContext,
+			callbackReason: this.callbackReason,
+			lastPlace: this.lastPlace,
+		});
 	}
 
 	private applyPersonRow(row: {
@@ -641,178 +315,100 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 
 	private trySendInitialGreeting() {
 		if (this.initialGreetingSent) return;
-		if (this.openAIWs?.readyState !== WebSocket.OPEN) return;
-		// OpenAI often reaches SessionUpdated before Twilio `start`; wait so we can load name/lang.
+		if (!this.providerReady) return;
+		// The provider is often ready before Twilio `start`; wait so we can load name/lang.
 		if (!this.twilioStreamStarted) return;
 		if (!this.personProfileResolved) return;
 
 		this.initialGreetingSent = true;
-		this.sendInitialGreeting();
+		this.provider?.start(
+			{
+				instructions: this.buildSessionInstructions(),
+				tools: this.systemMessage.tools,
+				language: this.callerPreferredLanguage,
+				firstName: this.callerFirstName,
+			},
+			this.callbackReason
+				? buildCallbackGreetingInstructions({
+						lang: this.callerPreferredLanguage,
+						firstName: this.callerFirstName,
+						reason: this.callbackReason,
+						refusedDoctorName: this.refusalContext?.refusedDoctorName,
+					})
+				: buildInitialGreetingInstructions(
+						this.callerPreferredLanguage,
+						this.callerFirstName,
+					),
+		);
+		this.logger.info(
+			{
+				language: this.callerPreferredLanguage,
+				hasCallerPhone: Boolean(this.callerPhone),
+			},
+			"🗣️ Session started, initial greeting triggered",
+		);
+		this.watchdog.start();
 	}
 
+	/** Refresh instructions after the session started (profile / language changed). */
 	private sendSessionConfig() {
-		if (this.openAIWs?.readyState !== WebSocket.OPEN) return;
-
-		this.openAIWs.send(
-			JSON.stringify({
-				type: "session.update",
-				session: {
-					instructions: this.buildSessionInstructions(),
-					tools: this.systemMessage.tools,
-					...SESSION_CONFIG,
-				},
-			}),
-		);
-		this.logger.info(
-			{ hasCallerPhone: Boolean(this.callerPhone) },
-			"✅ Session config sent to OpenAI",
-		);
-	}
-
-	private sendInitialGreeting() {
-		if (this.openAIWs?.readyState !== WebSocket.OPEN) return;
-
-		const instructions = buildInitialGreetingInstructions(
-			this.callerPreferredLanguage,
-			this.callerFirstName,
-		);
-		this.openAIWs.send(
-			JSON.stringify({
-				type: "response.create",
-				response: {
-					modalities: ["text", "audio"],
-					instructions,
-				},
-			}),
-		);
-		this.logger.info(
-			{ language: this.callerPreferredLanguage },
-			"🗣️ Initial greeting triggered",
-		);
-	}
-
-	// ==================== OpenAI Event Handlers ====================
-
-	private setupOpenAIHandlers() {
-		this.openAIWs.on("message", (data: RawData) =>
-			this.handleOpenAIMessage(data),
-		);
-		this.openAIWs.on("close", () => {
-			this.logger.info("🔴 OpenAI WebSocket closed");
-			this.dispose();
+		if (!this.initialGreetingSent) return;
+		this.provider?.updateSession({
+			instructions: this.buildSessionInstructions(),
+			tools: this.systemMessage.tools,
+			language: this.callerPreferredLanguage,
+			firstName: this.callerFirstName,
 		});
-		this.openAIWs.on("error", (error) =>
-			this.logger.error({ error }, "🔥 OpenAI WebSocket error"),
-		);
 	}
 
-	private handleOpenAIMessage(data: RawData) {
-		try {
-			const event = JSON.parse(data.toString());
-			console.log("-------------------- event --------------------");
-			console.log(event);
+	// ==================== Realtime Provider Event Handlers ====================
 
-			// biome-ignore lint/suspicious/noExplicitAny: screw this
-			const handlers: Record<string, (e: any) => void> = {
-				[EVENTS.SessionCreated]: () => {
-					this.logger.info("✅ OpenAI session created");
-					this.sendSessionConfig();
-				},
+	private handleAiTranscriptDelta(delta: string) {
+		if (!this.callSid) return;
+		this.currentAiTranscript += delta;
+		this.broadcastDashboard({
+			type: "ai_transcript",
+			callSid: this.callSid,
+			text: this.currentAiTranscript,
+			delta,
+			isFinal: false,
+		});
+	}
 
-				[EVENTS.SessionUpdated]: () => {
-					this.logger.info("✅ Session config updated");
-					this.trySendInitialGreeting();
-				},
-
-				[EVENTS.ResponseAudioDelta]: (e) => this.handleAudioDelta(e),
-
-				[EVENTS.ResponseAudioTranscriptDelta]: (e) => {
-					if (e.delta && this.callSid) {
-						this.currentAiTranscript += e.delta;
-						this.broadcastDashboard({
-							type: "ai_transcript",
-							callSid: this.callSid,
-							text: this.currentAiTranscript,
-							delta: e.delta,
-							isFinal: false,
-						});
-					}
-				},
-
-				[EVENTS.ResponseAudioTranscriptDone]: (e) => {
-					if (this.callSid) {
-						const finalText = e.transcript || this.currentAiTranscript;
-						this.broadcastDashboard({
-							type: "ai_transcript",
-							callSid: this.callSid,
-							text: finalText,
-							delta: "",
-							isFinal: true,
-						});
-						if (finalText) {
-							this.persistEvent({
-								type: "ai_transcript",
-								content: finalText,
-							});
-						}
-						this.currentAiTranscript = "";
-					}
-				},
-
-				[EVENTS.InputAudioBufferSpeechStarted]: () =>
-					this.handleSpeechStarted(),
-
-				[EVENTS.ConversationItemInputAudioTranscriptionCompleted]: (e) => {
-					if (e.transcript && this.callSid) {
-						this.logger.info({ transcript: e.transcript }, "📝 Patient said");
-						this.broadcastDashboard({
-							type: "patient_transcript",
-							callSid: this.callSid,
-							text: e.transcript,
-							isFinal: true,
-						});
-						this.persistEvent({
-							type: "patient_transcript",
-							content: e.transcript,
-						});
-					}
-				},
-
-				[EVENTS.ConversationItemInputAudioTranscriptionFailed]: (e) =>
-					this.logger.error({ error: e.error }, "🔥 Transcription failed"),
-
-				[EVENTS.ResponseFunctionCallArgumentsDone]: (e) =>
-					this.handleFunctionCall(e),
-
-				[EVENTS.ResponseDone]: () => {
-					this.logger.debug("✅ Response complete");
-					this.onResponseDone();
-				},
-
-				[EVENTS.Error]: (e) => {
-					this.logger.error({ error: e.error }, "🔥 OpenAI error");
-					if (this.callSid) {
-						const message = e.error?.message || "OpenAI error";
-						this.broadcastDashboard({
-							type: "error",
-							callSid: this.callSid,
-							message,
-						});
-						this.persistEvent({ type: "error", content: message });
-					}
-				},
-
-				[EVENTS.RateLimitsUpdated]: (e) =>
-					this.logger.info({ rateLimits: e.rate_limits }, "📊 Rate limits"),
-			};
-
-			const handler = handlers[event.type];
-			if (handler) {
-				handler(event);
-			}
-		} catch (error) {
-			this.logger.error({ error }, "🔥 Error processing OpenAI message");
+	private handleAiTranscriptDone(transcript: string) {
+		if (!this.callSid) return;
+		const finalText = transcript || this.currentAiTranscript;
+		this.broadcastDashboard({
+			type: "ai_transcript",
+			callSid: this.callSid,
+			text: finalText,
+			delta: "",
+			isFinal: true,
+		});
+		if (finalText) {
+			this.persistEvent({ type: "ai_transcript", content: finalText });
 		}
+		this.currentAiTranscript = "";
+	}
+
+	private handlePatientTranscript(transcript: string) {
+		this.watchdog.callerSpoke();
+		if (!this.callSid) return;
+		this.logger.info({ transcript }, "📝 Patient said");
+		this.broadcastDashboard({
+			type: "patient_transcript",
+			callSid: this.callSid,
+			text: transcript,
+			isFinal: true,
+		});
+		this.persistEvent({ type: "patient_transcript", content: transcript });
+	}
+
+	private handleProviderError(message: string, detail?: unknown) {
+		this.logger.error({ error: detail, message }, "🔥 Realtime provider error");
+		if (!this.callSid) return;
+		this.broadcastDashboard({ type: "error", callSid: this.callSid, message });
+		this.persistEvent({ type: "error", content: message });
 	}
 
 	// ==================== Twilio Event Handlers ====================
@@ -878,6 +474,10 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 								: "";
 					const trimmed = raw.trim();
 					this.callerPhone = trimmed.length > 0 ? trimmed : null;
+					this.callbackReason =
+						params.callMode === "callback"
+							? normalizeCallbackReason(params.callbackReason)
+							: null;
 					this.callStartedAt = new Date();
 
 					// Detect simulated browser calls so hangup closes the WS instead
@@ -887,7 +487,16 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 
 					// Ensure person exists (idempotent — /incoming-call likely already started this).
 					if (this.callerPhone) {
-						void ensurePersonRow(this.callerPhone).then((row) => {
+						void Promise.all([
+							ensurePersonRow(this.callerPhone),
+							getCallerRefusalContext(this.callerPhone),
+							getPeopleOnLine(this.callerPhone),
+							getCallerLastPlace(this.callerPhone),
+						]).then(([row, refusalContext, people, lastPlace]) => {
+							this.refusalContext = refusalContext;
+							this.lastPlace = lastPlace;
+							this.peopleOnLine =
+								people.length > 0 ? people : row ? ownerOnly(row) : [];
 							if (row != null) {
 								this.applyPersonRow(row);
 								this.sendSessionConfig();
@@ -922,25 +531,17 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 						timestamp: this.callStartedAt.toISOString(),
 					});
 
-					// Caller may arrive after OpenAI is connected; refresh instructions without re-greeting
-					if (this.openAIWs?.readyState === WebSocket.OPEN) {
-						this.sendSessionConfig();
-					}
+					this.trySendInitialGreeting();
 					break;
 				}
 
 				case "media":
 					this.latestMediaTimestamp = parseInt(msg.media.timestamp, 10);
 
-					// Forward audio to OpenAI
-					if (this.openAIWs?.readyState === WebSocket.OPEN) {
-						this.openAIWs.send(
-							JSON.stringify({
-								type: "input_audio_buffer.append",
-								audio: msg.media.payload,
-							}),
-						);
-					}
+					// Forward audio to the realtime model
+					this.provider?.sendAudio(msg.media.payload);
+					this.callerTranscriber?.push(msg.media.payload);
+					this.voiceDetector.push(msg.media.payload);
 
 					// Forward audio to dashboard clients listening to this call
 					if (this.callSid) {
@@ -955,6 +556,10 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 				case "mark":
 					if (this.markQueue.length > 0) {
 						this.markQueue.shift();
+					}
+					// Playback drained: the caller has heard everything said so far.
+					if (this.markQueue.length === 0) {
+						this.watchdog.setAssistantSpeaking(false);
 					}
 					this.tryScheduleHangupAfterPlayback();
 					break;
@@ -973,9 +578,10 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 
 	// ==================== Audio Handling ====================
 
-	// biome-ignore lint/suspicious/noExplicitAny: ignore
-	private handleAudioDelta(event: any) {
-		if (!event.delta || !this.streamSid) return;
+	private handleAudioDelta(payload: string, itemId?: string) {
+		if (!payload || !this.streamSid) return;
+		if (this.pendingHangup) this.goodbyeAudioStarted = true;
+		this.watchdog.setAssistantSpeaking(true);
 
 		// Send audio back to Twilio
 		this.twilioWs.send(
@@ -983,7 +589,7 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 				event: "media",
 				streamSid: this.streamSid,
 				media: {
-					payload: Buffer.from(event.delta, "base64").toString("base64"),
+					payload,
 				},
 			}),
 		);
@@ -992,8 +598,8 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 			this.responseStartTimestampTwilio = this.latestMediaTimestamp;
 		}
 
-		if (event.item_id) {
-			this.lastAssistantItem = event.item_id;
+		if (itemId) {
+			this.lastAssistantItem = itemId;
 		}
 
 		// Send mark to track playback progress
@@ -1004,7 +610,7 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 			this.broadcastDashboard({
 				type: "ai_audio",
 				callSid: this.callSid,
-				payload: event.delta,
+				payload,
 			});
 		}
 	}
@@ -1024,6 +630,7 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 	/** Handle interruption: patient starts speaking while AI is responding */
 	private handleSpeechStarted() {
 		if (this.pendingHangup) return;
+		this.watchdog.callerSpoke();
 		if (
 			this.markQueue.length > 0 &&
 			this.responseStartTimestampTwilio != null
@@ -1031,16 +638,9 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 			const elapsedTime =
 				this.latestMediaTimestamp - this.responseStartTimestampTwilio;
 
-			// Tell OpenAI to truncate the current response
+			// Tell the model how much of the reply the caller actually heard
 			if (this.lastAssistantItem) {
-				this.openAIWs.send(
-					JSON.stringify({
-						type: "conversation.item.truncate",
-						item_id: this.lastAssistantItem,
-						content_index: 0,
-						audio_end_ms: elapsedTime,
-					}),
-				);
+				this.provider?.truncate(this.lastAssistantItem, elapsedTime);
 			}
 
 			// Tell Twilio to clear its audio buffer
@@ -1058,55 +658,42 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 		}
 	}
 
+	// ==================== Watchdog (silence / time limit) ====================
+
+	private promptAssistant(prompt: WatchdogPrompt) {
+		this.provider?.prompt(
+			buildWatchdogInstructions(prompt, this.callerPreferredLanguage),
+		);
+	}
+
+	/** Say one goodbye line, then hang up the same way `end_call` does. */
+	private endWithGoodbye(prompt: WatchdogPrompt, note: string) {
+		if (this.pendingHangup || this.hangupScheduled) return;
+		this.logger.info(
+			{ callSid: this.callSid, prompt },
+			"📴 Watchdog ending call",
+		);
+		this.persistEvent({ type: "system", content: note });
+		this.pendingHangup = true;
+		this.goodbyeAudioStarted = false;
+		this.promptAssistant(prompt);
+		this.provider?.enterClosingMode();
+		this.scheduleFallbackHangup();
+	}
+
 	// ==================== Function Calling ====================
 
-	private sendFunctionCallOutput(
-		call_id: string,
-		output: string,
-		options?: { continueConversation?: boolean },
-	) {
-		this.openAIWs.send(
-			JSON.stringify({
-				type: "conversation.item.create",
-				item: {
-					type: "function_call_output",
-					call_id,
-					output,
-				},
-			}),
-		);
-		if (options?.continueConversation === false) return;
-		this.openAIWs.send(JSON.stringify({ type: "response.create" }));
+	private sendFunctionCallOutput(call: RealtimeFunctionCall, output: string) {
+		this.provider?.sendFunctionResult(call, output);
 	}
 
 	private onResponseDone() {
-		if (this.skipNextResponseDoneForEndCall) {
-			this.skipNextResponseDoneForEndCall = false;
-			return;
-		}
-		if (this.pendingHangup) {
+		if (this.markQueue.length === 0) this.watchdog.setAssistantSpeaking(false);
+		// Hang up only after the goodbye turn, not the turn that called `end_call`.
+		if (this.pendingHangup && this.goodbyeAudioStarted) {
 			this.hangupAfterPlayback = true;
 			this.tryScheduleHangupAfterPlayback();
 		}
-	}
-
-	private disableTurnDetectionForClosing() {
-		if (this.openAIWs?.readyState !== WebSocket.OPEN) return;
-		this.openAIWs.send(
-			JSON.stringify({
-				type: "session.update",
-				session: {
-					turn_detection: {
-						type: "server_vad",
-						threshold: SESSION_CONFIG.turn_detection.threshold,
-						silence_duration_ms:
-							SESSION_CONFIG.turn_detection.silence_duration_ms,
-						interrupt_response: false,
-						create_response: false,
-					},
-				},
-			}),
-		);
 	}
 
 	private tryScheduleHangupAfterPlayback() {
@@ -1191,12 +778,8 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 			});
 	}
 
-	private async handleFunctionCall(event: {
-		call_id: string;
-		name?: string;
-		arguments: string;
-	}) {
-		const { call_id, name, arguments: args } = event;
+	private async handleFunctionCall(call: RealtimeFunctionCall) {
+		const { callId: call_id, name, args } = call;
 
 		if (!name) {
 			console.log(
@@ -1250,7 +833,7 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 				});
 			}
 			this.sendFunctionCallOutput(
-				call_id,
+				call,
 				JSON.stringify({
 					error: true,
 					message: `${name}: invalid JSON arguments`,
@@ -1282,159 +865,40 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 			});
 		}
 
+		this.watchdog.toolStarted();
 		try {
 			let result: string;
 			let scheduleHangupAfterOutput = false;
 
 			switch (name) {
-				case "get_specialities":
-					result = this.getSpecialities();
-					break;
-				case "get_cities":
-					result = this.getCities();
-					break;
-				case "search_location": {
-					const args = parsedArgs as { city?: string; query?: string };
-					if (!args.city || !args.query) {
-						result = JSON.stringify({
-							error: true,
-							message:
-								"search_location: invalid arguments (expected city and query)",
-						});
-						break;
-					}
-					result = await this.searchLocation(args.city, args.query);
-					break;
-				}
 				case "end_call":
+				case "report_abuse":
+					// Report first so the admins get it even if the hangup fails below.
+					if (name === "report_abuse") {
+						await this.tools.run(name, parsedArgs, call_id);
+					}
 					if (!this.callSid) {
 						result = JSON.stringify({
 							error: true,
-							message: "end_call: no active call",
+							message: `${name}: no active call`,
 						});
-					} else if (
-						!this.isSimulated &&
-						(!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN)
-					) {
+					} else if (!this.isSimulated && !getTwilioRestClient()) {
 						result = JSON.stringify({
 							error: true,
-							message: "end_call: Twilio credentials not configured",
+							message: `${name}: Twilio credentials not configured`,
 						});
 					} else {
 						scheduleHangupAfterOutput = true;
-						const lang = normalizeCallLanguage(
-							(parsedArgs as { language?: string }).language,
+						result = buildHangupToolResult(
+							normalizeCallLanguage(
+								(parsedArgs as { language?: string }).language,
+							),
+							name === "report_abuse" ? "abuse" : "done",
 						);
-						const langHint =
-							lang === "fr"
-								? "French"
-								: lang === "en"
-									? "English"
-									: "Tunisian Arabic (Derja)";
-						result = JSON.stringify({
-							success: true,
-							message: `Call disconnect is scheduled when this response finishes. Say a brief thank-you and goodbye to the patient now (one short sentence, ${langHint}). Do not call other tools.`,
-						});
 					}
 					break;
-				case "find_available_slots": {
-					const slotArgs = normalizeFindAvailableSlotsArgs(parsedArgs);
-					if (!slotArgs) {
-						result = JSON.stringify({
-							error: true,
-							message:
-								"find_available_slots: invalid arguments (expected speciality_slug, latitude, longitude, optional preferred_time)",
-						});
-						break;
-					}
-					result = await this.findAvailableSlots(slotArgs);
-					break;
-				}
-				case "find_doctor_slots": {
-					const doctorSlotArgs = normalizeFindDoctorSlotsArgs(parsedArgs);
-					if (!doctorSlotArgs) {
-						result = JSON.stringify({
-							error: true,
-							message:
-								"find_doctor_slots: invalid arguments (expected doctor_id, optional preferred_time, optional limit)",
-						});
-						break;
-					}
-					result = await this.findDoctorSlots(doctorSlotArgs);
-					break;
-				}
-				case "book_appointment": {
-					const bookArgs = normalizeBookAppointmentArgs(parsedArgs);
-					if (!bookArgs) {
-						result = JSON.stringify({
-							error: true,
-							message:
-								"book_appointment: invalid arguments (expected doctor_id, patient_name, illness, start, end)",
-						});
-						break;
-					}
-					result = await this.bookAppointment(bookArgs);
-					break;
-				}
-				case "book_emergency_appointments": {
-					const emergencyArgs =
-						normalizeBookEmergencyAppointmentsArgs(parsedArgs);
-					if (!emergencyArgs) {
-						result = JSON.stringify({
-							error: true,
-							message:
-								"book_emergency_appointments: invalid arguments (expected speciality_slug, latitude, longitude, patient_name, illness)",
-						});
-						break;
-					}
-					result = await this.bookEmergencyAppointments(emergencyArgs);
-					break;
-				}
-				case "update_person_info": {
-					const personArgs = normalizeUpdatePersonInfoArgs(parsedArgs);
-					if (!personArgs) {
-						result = JSON.stringify({
-							error: true,
-							message:
-								"update_person_info: invalid arguments (expected at least one of first_name, last_name, date_of_birth, gender, address, preferred_language)",
-						});
-						break;
-					}
-					result = await this.updatePersonInfo(personArgs);
-					break;
-				}
-				case "list_my_ai_appointments": {
-					const includeRecentPast =
-						parsedArgs !== null &&
-						typeof parsedArgs === "object" &&
-						!Array.isArray(parsedArgs) &&
-						(parsedArgs as { include_recent_past?: boolean })
-							.include_recent_past === true;
-					result = await this.listMyAiAppointments({ includeRecentPast });
-					break;
-				}
-				case "cancel_appointment": {
-					const cancelArgs = normalizeCancelAppointmentArgs(parsedArgs);
-					if (!cancelArgs) {
-						result = JSON.stringify({
-							error: true,
-							message:
-								"cancel_appointment: invalid arguments (expected appointment_id)",
-						});
-						break;
-					}
-					result = await this.cancelAppointment(cancelArgs.appointmentId);
-					break;
-				}
 				default:
-					console.log(
-						"---------------------- UNKNOWN TOOL ----------------------",
-					);
-					console.log("tool:", name, "call_id:", call_id, "input:", parsedArgs);
-					console.log(
-						"-------------------------------------------------------------",
-					);
-					result = JSON.stringify({ error: `Unknown function: ${name}` });
+					result = await this.tools.run(name, parsedArgs, call_id);
 			}
 
 			if (name === "get_specialities" || name === "get_cities") {
@@ -1489,16 +953,16 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 				});
 			}
 
-			this.sendFunctionCallOutput(call_id, result, {
-				continueConversation: true,
-			});
-
 			if (scheduleHangupAfterOutput) {
+				this.watchdog.stop();
+				// Set before sending the result so the goodbye audio is recognised.
 				this.pendingHangup = true;
-				this.skipNextResponseDoneForEndCall = true;
-				this.disableTurnDetectionForClosing();
+				this.goodbyeAudioStarted = false;
+				this.provider?.enterClosingMode();
 				this.scheduleFallbackHangup();
 			}
+
+			this.sendFunctionCallOutput(call, result);
 		} catch (error: unknown) {
 			consoleLogToolHttpError(
 				name,
@@ -1538,624 +1002,15 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 			}
 
 			this.sendFunctionCallOutput(
-				call_id,
+				call,
 				JSON.stringify({
 					error: true,
 					message: reason,
 				}),
 			);
+		} finally {
+			this.watchdog.toolFinished();
 		}
-	}
-
-	private getSpecialities(): string {
-		return JSON.stringify(
-			SPECIALITIES.map(({ slug, en_name, fr_name, ar_name }) => ({
-				slug,
-				en_name,
-				fr_name,
-				ar_name,
-			})),
-		);
-	}
-
-	private getCities(): string {
-		return JSON.stringify(
-			CITIES.map(
-				({ slug, latitude, longitude, en_name, fr_name, ar_name }) => ({
-					slug,
-					latitude,
-					longitude,
-					en_name,
-					fr_name,
-					ar_name,
-				}),
-			),
-		);
-	}
-
-	private async searchLocation(city: string, query: string): Promise<string> {
-		const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY;
-		if (!GEOAPIFY_API_KEY) {
-			this.logger.error("GEOAPIFY_API_KEY is not set");
-			return JSON.stringify({
-				error: true,
-				message: "Geocoding API key not configured.",
-			});
-		}
-		try {
-			const { data } = await axios.get(
-				"https://api.geoapify.com/v1/geocode/search",
-				{
-					params: {
-						text: `${query}, ${city}`,
-						filter: "countrycode:tn",
-						limit: 5,
-						apiKey: GEOAPIFY_API_KEY,
-					},
-				},
-			);
-			const features = data.features || [];
-			if (features.length === 0) {
-				return JSON.stringify({
-					found: false,
-					message:
-						"No results found. Please ask the patient for more context (e.g., region, city).",
-				});
-			}
-
-			// biome-ignore lint/suspicious/noExplicitAny: geoapify structure
-			const results = features.map((f: any) => ({
-				name: f.properties.formatted,
-				city: f.properties.city,
-				state: f.properties.state,
-				street: f.properties.street,
-				latitude: f.properties.lat,
-				longitude: f.properties.lon,
-			}));
-
-			return JSON.stringify({
-				found: true,
-				results,
-				message:
-					results.length > 1
-						? "Multiple results found. Please ask the patient to clarify which one they mean by presenting the options."
-						: "One result found. Proceed with this location.",
-			});
-		} catch (error) {
-			this.logger.error({ error }, "Geocoding API error");
-			return JSON.stringify({
-				error: true,
-				message: "Failed to search location.",
-			});
-		}
-	}
-
-	private async findAvailableSlots(params: {
-		specialitySlug: string;
-		latitude: number;
-		longitude: number;
-		preferredTime?: string;
-	}): Promise<string> {
-		const path = "/api/doctors/best-fit";
-		// Next route expects query keys: speciality, lat, long, time
-		const query = {
-			speciality: params.specialitySlug,
-			lat: params.latitude,
-			long: params.longitude,
-			time: params.preferredTime,
-		};
-
-		console.log(
-			"---------------------- find_available_slots REQUEST ----------------------",
-		);
-		console.log("url:", nextjsApi.getUri({ url: path, params: query }));
-		console.log("query:", JSON.stringify(query, null, 2));
-		console.log(
-			"-------------------------------------------------------------",
-		);
-
-		const { data } = await nextjsApi.get<BestFitDoctor[]>(path, {
-			params: query,
-		});
-
-		if (!data || data.length === 0) {
-			console.log(
-				"---------------------- find_available_slots EMPTY ----------------------",
-			);
-			console.log("query:", JSON.stringify(query, null, 2));
-			console.log("doctorCount:", data?.length ?? 0);
-			console.log(
-				"-------------------------------------------------------------",
-			);
-			return JSON.stringify({
-				found: false,
-				message:
-					"No doctors with available slots were found for this speciality and location.",
-			});
-		}
-
-		// Return top 3 for the AI (doctorId = doctorProfile.id for book_appointment)
-		const top = data.slice(0, 3).map((doc) => ({
-			doctorId: doc.id,
-			name: `Dr. ${doc.firstName} ${doc.lastName}`,
-			cabinet: doc.cabinetName,
-			address: doc.address ?? null,
-			distanceKm: Math.round(doc.distance * 10) / 10,
-			slotStart: doc.nextSlot.start,
-			slotEnd: doc.nextSlot.end,
-			// Additional nearby slots so the AI can offer alternatives without
-			// a second find_available_slots call.
-			nearbySlots: (doc.nearbySlots ?? []).map((s) => ({
-				slotStart: s.start,
-				slotEnd: s.end,
-			})),
-		}));
-
-		console.log(
-			"---------------------- find_available_slots OK ----------------------",
-		);
-		console.log("totalMatches:", data.length, "returned:", top.length);
-		console.log(
-			"doctorIds:",
-			top.map((d) => d.doctorId),
-		);
-		console.log("top:", JSON.stringify(top, null, 2));
-		console.log(
-			"-------------------------------------------------------------",
-		);
-
-		return JSON.stringify({ found: true, doctors: top });
-	}
-
-	private async findDoctorSlots(params: {
-		doctorId: number;
-		preferredTime?: string;
-		limit?: number;
-	}): Promise<string> {
-		const path = "/api/doctors/availability";
-		const query = {
-			doctor_id: params.doctorId,
-			time: params.preferredTime,
-			limit: params.limit,
-		};
-
-		console.log(
-			"---------------------- find_doctor_slots REQUEST ----------------------",
-		);
-		console.log("url:", nextjsApi.getUri({ url: path, params: query }));
-		console.log("query:", JSON.stringify(query, null, 2));
-		console.log(
-			"-------------------------------------------------------------",
-		);
-
-		const { data } = await nextjsApi.get<DoctorAvailabilityResponse>(path, {
-			params: query,
-		});
-
-		const doctorName = `Dr. ${data.doctor.firstName} ${data.doctor.lastName}`;
-		if (!data.found || data.slots.length === 0) {
-			console.log(
-				"---------------------- find_doctor_slots EMPTY ----------------------",
-			);
-			console.log("query:", JSON.stringify(query, null, 2));
-			console.log("doctor:", doctorName, "doctorId:", data.doctor.id);
-			console.log(
-				"-------------------------------------------------------------",
-			);
-			return JSON.stringify({
-				found: false,
-				doctor: {
-					doctorId: data.doctor.id,
-					name: doctorName,
-					cabinet: data.doctor.cabinetName,
-					address: data.doctor.address ?? null,
-				},
-				message: "No available slots were found for this doctor.",
-			});
-		}
-
-		const slots = data.slots.map((slot) => ({
-			slotStart: slot.start,
-			slotEnd: slot.end,
-		}));
-
-		console.log(
-			"---------------------- find_doctor_slots OK ----------------------",
-		);
-		console.log("doctor:", doctorName, "doctorId:", data.doctor.id);
-		console.log("returnedSlots:", slots.length);
-		console.log("slots:", JSON.stringify(slots, null, 2));
-		console.log(
-			"-------------------------------------------------------------",
-		);
-
-		return JSON.stringify({
-			found: true,
-			doctor: {
-				doctorId: data.doctor.id,
-				name: doctorName,
-				cabinet: data.doctor.cabinetName,
-				address: data.doctor.address ?? null,
-			},
-			slots,
-		});
-	}
-
-	private async listMyAiAppointments(options?: {
-		includeRecentPast?: boolean;
-	}): Promise<string> {
-		const callerRaw = this.callerPhone?.trim();
-		if (!callerRaw) {
-			return JSON.stringify({
-				error: true,
-				message: "list_my_ai_appointments: no caller phone on this call",
-			});
-		}
-		const data = await listCallerAiAppointments(callerRaw, {
-			includeRecentPast: options?.includeRecentPast,
-		});
-		return JSON.stringify({
-			found: data.upcoming.length > 0 || data.recentPast.length > 0,
-			upcoming: data.upcoming,
-			recentPast: data.recentPast,
-			message:
-				"Times are UTC in JSON; tell the patient times in Tunisia GMT+1. For confirmed appointments, cancellation by phone is not allowed — patient must contact the doctor.",
-		});
-	}
-
-	private async cancelAppointment(appointmentId: number): Promise<string> {
-		const callerRaw = this.callerPhone?.trim();
-		if (!callerRaw) {
-			return JSON.stringify({
-				error: true,
-				message: "cancel_appointment: no caller phone on this call",
-			});
-		}
-		try {
-			const data = await cancelCallerAiAppointment(callerRaw, appointmentId);
-			return JSON.stringify({
-				success: true,
-				appointment_id: data.appointmentId,
-				status: data.status,
-				message: "Appointment cancelled successfully.",
-			});
-		} catch (error: unknown) {
-			const code =
-				error &&
-				typeof error === "object" &&
-				"response" in error &&
-				error.response &&
-				typeof error.response === "object" &&
-				"data" in error.response &&
-				error.response.data &&
-				typeof error.response.data === "object" &&
-				"error" in error.response.data
-					? String((error.response.data as { error: unknown }).error)
-					: undefined;
-			if (code === "APPOINTMENT_NOT_CANCELLABLE") {
-				return JSON.stringify({
-					error: true,
-					code,
-					message:
-						"This appointment is already confirmed. The patient must contact the doctor's office to cancel or change it.",
-				});
-			}
-			if (code === "FORBIDDEN" || code === "APPOINTMENT_NOT_FOUND") {
-				return JSON.stringify({
-					error: true,
-					code,
-					message: "That appointment was not found for this caller.",
-				});
-			}
-			throw error;
-		}
-	}
-
-	private async bookAppointment(
-		params: BookAppointmentToolArgs,
-	): Promise<string> {
-		console.log(
-			"---------------------- book_appointment INPUT ----------------------",
-		);
-		console.log(JSON.stringify(params, null, 2));
-		console.log("callerPhone:", this.callerPhone);
-		console.log(
-			"-------------------------------------------------------------",
-		);
-
-		const callerRaw = this.callerPhone?.trim();
-		if (!callerRaw) {
-			const msg =
-				"book_appointment: no caller phone on this call (Twilio From / callerPhone)";
-			console.log(
-				"---------------------- book_appointment VALIDATION ERROR ----------------------",
-			);
-			console.log(msg);
-			console.log(
-				"-------------------------------------------------------------",
-			);
-			throw new Error(msg);
-		}
-		const phoneNumber = phoneDigitsOnly(callerRaw);
-		if (phoneNumber.length < 8) {
-			const msg = `book_appointment: caller phone too short after normalization (${phoneNumber.length} digits)`;
-			console.log(
-				"---------------------- book_appointment VALIDATION ERROR ----------------------",
-			);
-			console.log("callerPhone:", callerRaw, "digits:", phoneNumber);
-			console.log(
-				"-------------------------------------------------------------",
-			);
-			throw new Error(msg);
-		}
-
-		const doctorId = Number(params.doctorId);
-		if (
-			!Number.isFinite(doctorId) ||
-			doctorId <= 0 ||
-			!Number.isInteger(doctorId)
-		) {
-			const msg = `Invalid doctorId: expected a positive integer (from find_available_slots doctorId), got ${JSON.stringify(params.doctorId)}`;
-			console.log(
-				"---------------------- book_appointment VALIDATION ERROR ----------------------",
-			);
-			console.log("params:", JSON.stringify(params, null, 2));
-			console.log("doctorIdParsed:", doctorId);
-			console.log(
-				"-------------------------------------------------------------",
-			);
-			throw new Error(msg);
-		}
-
-		const body: BookAppointmentParams = {
-			doctorId,
-			name: params.patientName,
-			phoneNumber,
-			illness: params.illness,
-			start: params.start,
-			end: params.end,
-		};
-
-		const bookPath = "/api/appointments/external";
-		console.log(
-			"---------------------- book_appointment REQUEST ----------------------",
-		);
-		console.log("url:", `${nextjsApi.defaults.baseURL}${bookPath}`);
-		console.log("body:", JSON.stringify(body, null, 2));
-		console.log(
-			"-------------------------------------------------------------",
-		);
-
-		const { data } = await nextjsApi.post(bookPath, body);
-
-		console.log(
-			"---------------------- book_appointment RESPONSE ----------------------",
-		);
-		console.log(data);
-		console.log(
-			"-------------------------------------------------------------",
-		);
-
-		// biome-ignore lint/suspicious/noExplicitAny: API row shape varies
-		const row = data as any;
-		const appointmentId = row?.id ?? row?._id;
-
-		// Broadcast to dashboard
-		if (this.callSid) {
-			this.broadcastDashboard({
-				type: "appointment_booked",
-				callSid: this.callSid,
-				data,
-			});
-			this.persistEvent({
-				type: "appointment_booked",
-				content: `Appointment #${appointmentId ?? "?"} booked`,
-				functionResult: data,
-			});
-			this.persistCallUpdate({
-				appointmentId: appointmentId ?? null,
-				callerName: params.patientName,
-			});
-		}
-
-		return JSON.stringify({
-			success: true,
-			appointment_id: appointmentId,
-			status: row?.status,
-			message: "Appointment created successfully with pending status.",
-		});
-	}
-
-	private async bookEmergencyAppointments(
-		params: BookEmergencyAppointmentsToolArgs,
-	): Promise<string> {
-		console.log(
-			"---------------------- book_emergency_appointments INPUT ----------------------",
-		);
-		console.log(JSON.stringify(params, null, 2));
-		console.log("callerPhone:", this.callerPhone);
-		console.log(
-			"-------------------------------------------------------------",
-		);
-
-		const callerRaw = this.callerPhone?.trim();
-		if (!callerRaw) {
-			return JSON.stringify({
-				error: true,
-				message:
-					"book_emergency_appointments: no caller phone on this call (Twilio From / callerPhone)",
-			});
-		}
-
-		const phoneNumber = phoneDigitsOnly(callerRaw);
-		if (phoneNumber.length < 8) {
-			return JSON.stringify({
-				error: true,
-				message: `book_emergency_appointments: caller phone too short after normalization (${phoneNumber.length} digits)`,
-			});
-		}
-
-		const body = {
-			speciality: params.specialitySlug,
-			lat: params.latitude,
-			long: params.longitude,
-			name: params.patientName,
-			phoneNumber,
-			illness: params.illness,
-		};
-
-		const bookPath = "/api/appointments/external/emergency";
-		console.log(
-			"---------------------- book_emergency_appointments REQUEST ----------------------",
-		);
-		console.log("url:", `${nextjsApi.defaults.baseURL}${bookPath}`);
-		console.log("body:", JSON.stringify(body, null, 2));
-		console.log(
-			"-------------------------------------------------------------",
-		);
-
-		const { data } = await nextjsApi.post<{
-			found: boolean;
-			emergencyGroupId?: string;
-			appointments?: Array<{ id?: number; doctorId?: number }>;
-			doctors?: Array<{
-				doctorId: number;
-				name: string;
-				cabinet: string | null;
-				address: string | null;
-				distanceKm: number;
-				slotStart: string;
-				slotEnd: string;
-			}>;
-			message?: string;
-		}>(bookPath, body);
-
-		console.log(
-			"---------------------- book_emergency_appointments RESPONSE ----------------------",
-		);
-		console.log(data);
-		console.log(
-			"-------------------------------------------------------------",
-		);
-
-		if (!data.found || !data.appointments?.length) {
-			return JSON.stringify({
-				success: false,
-				found: false,
-				message:
-					data.message ??
-					"No nearby doctors available for an urgent booking right now.",
-			});
-		}
-
-		if (this.callSid) {
-			for (const appt of data.appointments) {
-				this.broadcastDashboard({
-					type: "appointment_booked",
-					callSid: this.callSid,
-					data: {
-						...appt,
-						urgent: true,
-						newPatientName: params.patientName,
-					},
-				});
-			}
-			this.persistEvent({
-				type: "appointment_booked",
-				content: `Urgent fan-out: ${data.appointments.length} pending appointment(s)`,
-				functionResult: data,
-			});
-			this.persistCallUpdate({
-				appointmentId: data.appointments[0]?.id ?? null,
-				callerName: params.patientName,
-			});
-		}
-
-		return JSON.stringify({
-			success: true,
-			found: true,
-			emergency_group_id: data.emergencyGroupId,
-			count: data.appointments.length,
-			doctors: data.doctors,
-			message:
-				data.message ??
-				"Urgent requests sent to nearby doctors. The first to accept keeps the appointment.",
-		});
-	}
-
-	private async updatePersonInfo(
-		params: UpdatePersonInfoToolArgs,
-	): Promise<string> {
-		console.log(
-			"---------------------- update_person_info INPUT ----------------------",
-		);
-		console.log(JSON.stringify(params, null, 2));
-		console.log("personId:", this.personId);
-		console.log(
-			"-------------------------------------------------------------",
-		);
-
-		if (this.personId == null && this.callerPhone) {
-			console.log(
-				"---------------------- update_person_info AWAITING PERSON ----------------------",
-			);
-			console.log("callerPhone:", this.callerPhone);
-			console.log(
-				"-------------------------------------------------------------",
-			);
-			const row = await ensurePersonRow(this.callerPhone);
-			if (row != null) this.applyPersonRow(row);
-		}
-
-		if (this.personId == null) {
-			const msg =
-				"update_person_info: no person record for this caller (ensurePersonRow may still be pending)";
-			console.log(
-				"---------------------- update_person_info VALIDATION ERROR ----------------------",
-			);
-			console.log(msg);
-			console.log("callerPhone:", this.callerPhone);
-			console.log(
-				"-------------------------------------------------------------",
-			);
-			throw new Error(msg);
-		}
-
-		const path = `/api/persons/${this.personId}`;
-		console.log(
-			"---------------------- update_person_info REQUEST ----------------------",
-		);
-		console.log("url:", `${nextjsApi.defaults.baseURL}${path}`);
-		console.log("body:", JSON.stringify(params, null, 2));
-		console.log(
-			"-------------------------------------------------------------",
-		);
-
-		const data = await updatePersonRow(this.personId, params);
-
-		console.log(
-			"---------------------- update_person_info RESPONSE ----------------------",
-		);
-		console.log(data);
-		console.log(
-			"-------------------------------------------------------------",
-		);
-
-		if (params.firstName?.trim()) {
-			this.callerFirstName = params.firstName.trim();
-		}
-		if (params.preferredLanguage) {
-			this.callerPreferredLanguage = params.preferredLanguage;
-		}
-		if (params.firstName || params.preferredLanguage) {
-			this.sendSessionConfig();
-		}
-
-		return JSON.stringify({
-			success: true,
-			person_id: data.id,
-			message: "Person record updated successfully.",
-		});
 	}
 
 	// ==================== DB Persistence Helpers ====================
@@ -2196,17 +1051,11 @@ The server uses this number automatically when \`book_appointment\`, \`list_my_a
 
 	dispose() {
 		this.logger.info("🗑️ Disposing TwilioSession");
+		this.watchdog.stop();
 		this.clearHangupTimers();
+		this.callerTranscriber?.close();
 
-		if (this.openAIWs) {
-			this.openAIWs.removeAllListeners();
-			if (
-				this.openAIWs.readyState !== WebSocket.CLOSED &&
-				this.openAIWs.readyState !== WebSocket.CLOSING
-			) {
-				this.openAIWs.close();
-			}
-		}
+		this.provider?.close();
 
 		if (this.twilioWs) {
 			this.twilioWs.removeAllListeners();

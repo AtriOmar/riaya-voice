@@ -3,7 +3,7 @@
 	"version": "1.0.0",
 	"main": "dist/server.js",
 	"license": "ISC",
-	"description": "Riaya Realtime - Twilio phone call to Azure OpenAI Realtime API bridge for doctor appointment booking",
+	"description": "Riaya Realtime - Twilio phone call to Gemini Live / OpenAI Realtime bridge for doctor appointment booking",
 	"type": "module",
 	"nodemonConfig": {
 		"ignore": [
@@ -18,12 +18,18 @@
 		"lint": "biome check --write",
 		"format": "biome format --write",
 		"fix:all": "biome check --write && biome format --write",
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"agent:dev": "tsx --env-file=.env src/livekit/agent.ts dev",
+		"agent:start": "node --env-file=.env dist/livekit/agent.js start"
 	},
 	"dependencies": {
-		"@azure/identity": "^4.11.1",
 		"@biomejs/biome": "^2.4.10",
 		"@hapi/boom": "^10.0.1",
+		"@livekit/agents": "^1.9.1",
+		"@livekit/agents-plugin-inworld": "^1.9.1",
+		"@livekit/agents-plugin-openai": "^1.9.1",
+		"@livekit/agents-plugin-silero": "^1.9.1",
+		"@livekit/rtc-node": "^1.1.0",
 		"@whiskeysockets/baileys": "7.0.0-rc13",
 		"axios": "^1.7.9",
 		"bullmq": "^6.3.2",
@@ -35,7 +41,8 @@
 		"pino-pretty": "^13.1.1",
 		"qrcode": "^1.5.4",
 		"twilio": "^6.0.0",
-		"ws": "^8.18.3"
+		"ws": "^8.18.3",
+		"zod": "^4.6.5"
 	},
 	"pnpm": {
 		"onlyBuiltDependencies": [

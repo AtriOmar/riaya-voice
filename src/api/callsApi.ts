@@ -1,16 +1,6 @@
 import { nextjsApi } from "./nextjsApiClient.js";
 
-/**
- * Client for the Next.js /api/calls endpoints. Authenticates using a shared
- * `INTERNAL_API_SECRET` env var that both the socket service and the web app know.
- */
-
-const INTERNAL_API_SECRET = process.env.INTERNAL_API_SECRET || "";
-
-const internalHeaders = () => ({
-	"x-internal-secret": INTERNAL_API_SECRET,
-	"Content-Type": "application/json",
-});
+/** Client for the Next.js /api/calls endpoints (internal secret set on `nextjsApi`). */
 
 /** In-memory cache of ongoing `POST /api/calls` requests, keyed by callSid,
  *  so both `/incoming-call` and the media-stream `start` event resolve to the
@@ -36,7 +26,6 @@ export function ensureCallRow(input: CreateCallInput): Promise<number | null> {
 			const { data } = await nextjsApi.post<{ id: number }>(
 				"/api/calls",
 				input,
-				{ headers: internalHeaders() },
 			);
 			return data.id;
 		} catch (err) {
@@ -71,9 +60,7 @@ export async function createCallEvent(
 	input: CreateCallEventInput,
 ): Promise<void> {
 	try {
-		await nextjsApi.post(`/api/calls/${callId}/events`, input, {
-			headers: internalHeaders(),
-		});
+		await nextjsApi.post(`/api/calls/${callId}/events`, input);
 	} catch (err) {
 		console.error("[callsApi] createCallEvent failed", err);
 	}
@@ -92,9 +79,7 @@ export async function updateCall(
 	input: UpdateCallInput,
 ): Promise<void> {
 	try {
-		await nextjsApi.put(`/api/calls/${callId}`, input, {
-			headers: internalHeaders(),
-		});
+		await nextjsApi.put(`/api/calls/${callId}`, input);
 	} catch (err) {
 		console.error("[callsApi] updateCall failed", err);
 	}

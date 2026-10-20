@@ -23,25 +23,29 @@ const connection = new Redis(
 export const subscriptionWorker = new Worker(
 	"subscription-queue",
 	async (job) => {
-		logger.info({ jobId: job.id, name: job.name }, "[SubscriptionWorker] Processing job");
+		logger.info(
+			{ jobId: job.id, name: job.name },
+			"[SubscriptionWorker] Processing job",
+		);
 
 		if (job.name === "check-expiring") {
 			const response = await nextjsApi.post(
 				"/api/internal/subscriptions/process-expiring",
 				{},
-				{
-					headers: {
-						"x-internal-secret": process.env.INTERNAL_API_SECRET ?? "",
-					},
-				},
 			);
 
 			logger.info(
-				{ processed: response.data?.processed, results: response.data?.results },
+				{
+					processed: response.data?.processed,
+					results: response.data?.results,
+				},
 				"[SubscriptionWorker] Expiring subscriptions processed",
 			);
 		} else {
-			logger.warn({ name: job.name }, "[SubscriptionWorker] Unknown job name — skipping");
+			logger.warn(
+				{ name: job.name },
+				"[SubscriptionWorker] Unknown job name — skipping",
+			);
 		}
 	},
 	{ connection },

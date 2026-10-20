@@ -36,13 +36,7 @@ export const reviewWorker = new Worker(
 				},
 			);
 
-			const {
-				success,
-				reason,
-				phone,
-				adminId,
-				message,
-			} = response.data;
+			const { success, reason, phone, adminId, message } = response.data;
 
 			if (!success) {
 				logger.info({ reason }, "[ReviewWorker] Job skipped");
@@ -62,31 +56,6 @@ export const reviewWorker = new Worker(
 				logger.error({ status }, "[ReviewWorker] WhatsApp not connected");
 				// Throw error so BullMQ retries later
 				throw new Error("WhatsApp not connected");
-			}
-
-			// Consume monthly WhatsApp quota (skip send if Free plan limit hit)
-			try {
-				await nextjsApi.post(
-					"/api/internal/billing/consume-whatsapp",
-					{ userId: adminId, count: 1 },
-					{
-						headers: {
-							"x-internal-secret": process.env.INTERNAL_API_SECRET ?? "",
-						},
-					},
-				);
-			} catch (quotaErr: unknown) {
-				const ax = quotaErr as {
-					response?: { data?: { error?: string } };
-				};
-				if (ax.response?.data?.error === "WHATSAPP_LIMIT_REACHED") {
-					logger.info(
-						{ appointmentId, adminId },
-						"[ReviewWorker] WhatsApp limit reached — skipping review message",
-					);
-					return;
-				}
-				throw quotaErr;
 			}
 
 			if (!message) {

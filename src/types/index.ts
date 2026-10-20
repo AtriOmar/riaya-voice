@@ -145,6 +145,11 @@ export type BestFitDoctor = {
 	createdAt: string;
 	updatedAt: string;
 	distance: number;
+	/** True when beyond the search radius (returned as a fallback). */
+	outsideRadius?: boolean;
+	/** Road distance / drive time when routing succeeded. */
+	roadDistanceKm?: number;
+	driveMinutes?: number;
 	nextSlot: { start: string; end: string };
 	/** Additional forward slots near desiredTime for same-call alternatives. */
 	nearbySlots?: { start: string; end: string }[];
@@ -166,11 +171,20 @@ export type DoctorAvailabilityResponse = {
 /** Body for `POST /api/appointments/external` */
 export type BookAppointmentParams = {
 	doctorId: number;
-	name: string;
+	/** The calling phone line. */
 	phoneNumber: string;
+	/** Who it is for: someone on the line (`personId`) or a new family member (`relationship`). */
+	patient: {
+		personId?: number;
+		firstName: string;
+		lastName?: string;
+		relationship?: "child" | "parent" | "spouse" | "sibling" | "other";
+	};
 	illness: string;
 	start: string;
 	end: string;
+	/** Where the patient searched from; kept on the booking for the next call. */
+	patientPlace?: { label: string | null; lat: number; long: number };
 };
 
 export type FindSlotsParams = {

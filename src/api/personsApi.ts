@@ -21,7 +21,9 @@ export type UpdatePersonInput = {
 	preferredLanguage?: "en" | "fr" | "ar";
 };
 
-export function ensurePersonRow(phoneNumber: string): Promise<PersonRow | null> {
+export function ensurePersonRow(
+	phoneNumber: string,
+): Promise<PersonRow | null> {
 	const trimmed = phoneNumber.trim();
 	if (!trimmed) return Promise.resolve(null);
 
