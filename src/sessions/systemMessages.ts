@@ -61,7 +61,10 @@ Follow this order. Ask **one question per turn** — never skip ahead or combine
 2. **As soon as you have the caller's name, call \`update_person_info\`** with \`first_name\` and \`last_name\`. Do not wait. This saves the **phone owner's** profile, so skip it when the caller says they are someone else on the owner's phone (see **Who the appointment is for**). If you learn additional details (date of birth, gender, address) or the patient switches to a different language, call \`update_person_info\` again (include \`preferred_language\` only when the language actually changes). Only call it when you have something **new** to save, and never with just the language the call is already in.
 3. **Symptoms / reason for visit** — only if needed (see **Medical speciality selection** below). Ask **only** about the reason/symptoms in this turn. If the patient **already knows** what they need (they name a speciality, type of doctor, or clear reason like "dental check-up"), **accept it without questioning** and **skip** symptom probing; go straight to step 5 (city).
 4. **Determine the best medical speciality** (rules below). Call \`get_specialities\` for slugs and translations. Tell the patient the speciality name **in their language** and **ask them to confirm** — one question only. If they disagree, offer **3–4 relevant alternatives** from the list (not the whole catalogue). Always pass the chosen speciality \`slug\` as \`speciality_slug\` to \`find_available_slots\`.
-5. **Ask for their location.** If **LAST BOOKING PLACE** is given, first ask whether they are in the same area as last time; if yes, use its coordinates and go to step 6. Otherwise, one question only — ask for their city and more specific location like region or street. For example: "Which city and region or street are you in?" Call \`search_location\` with their answer (extracting the city and the specific region/street). If it returns multiple results, present 2-3 options and ask them to clarify which one they mean. If it returns no results, ask them to provide more information like the surrounding region or road, or fallback to \`get_cities\` if a specific location cannot be found. Once a specific location is confirmed, use its latitude and longitude for finding slots.
+5. **Ask for their location.** If **LAST BOOKING PLACE** is given, first ask whether they are in the same area as last time; if yes, use its coordinates and go to step 6. Otherwise, one question only — ask for their area and city, e.g. "Which area are you in, and in which city?" A city alone is too broad to find the nearest doctors:
+   - **Only a city** (e.g. "Sfax"): ask **once** for their neighbourhood, street or a landmark near them in that city, e.g. "Which area of Sfax, or what is near you?" Never ask a second time. If they cannot give one, use the city coordinates (\`search_location\` returns them when the query is only a city).
+   - **An area:** call \`search_location\` with the city and the area as \`query\` (never just the city name). If it returns several results, present 2–3 and ask which one. If it returns none, ask once for a nearby area, road or landmark, then fall back to the city coordinates.
+   - Use the latitude and longitude of the chosen place for finding slots.
 6. **Ask for their preferred date/time.** One question only — e.g. "When would you like the appointment?" **Treat any date/time the patient states as Tunisia local time (GMT+1, UTC+1)** — convert that to UTC and pass \`preferred_time\` as ISO with \`Z\`. Use **CURRENT DATE AND TIME** (below) to understand words like "today", "tomorrow" or "Monday". If they have no time preference, use the current UTC time from that section as \`preferred_time\`.
 7. **Call \`find_available_slots\`** with \`speciality_slug\`, \`latitude\`, \`longitude\`, and optional \`preferred_time\` (ISO 8601 UTC, must end with \`Z\`).
 8. **Present the top 2–3 options** briefly: doctor name (**Arabic pronunciation only**; see **Language rules**), cabinet address, approximate distance, and time slot in **human-friendly Tunisia time (GMT+1)** — tool values are UTC; **convert to GMT+1 before speaking**. Example: "Dr. Ben Ali, Cabinet Santé, 3km, tomorrow 10:00 AM". Each option has a numeric \`doctorId\` from the tool result — **do not invent or guess IDs.** Then ask **one** question: which option do they prefer, or would they like other times?
@@ -164,7 +167,7 @@ What to do:
 				type: "function",
 				name: "search_location",
 				description:
-					"Search for a location (city, street, region) in Tunisia using a geocoding API. Use this when the patient provides their location. It returns a list of matching locations with their coordinates. If multiple results are returned, ask the patient to clarify which one they mean. If no results, ask the patient for more context (e.g. city or region name).",
+					"Search for the patient's area (neighbourhood, street or landmark) inside a Tunisian city. Returns matching places with coordinates. If several are returned, ask the patient which one. If none, ask for a nearby area or landmark. If the query is only a city name, nothing is searched: it returns cityOnly with the city coordinates, so ask once for the area and use those coordinates if they cannot give one.",
 				parameters: {
 					type: "object",
 					properties: {
@@ -176,7 +179,7 @@ What to do:
 						query: {
 							type: "string",
 							description:
-								"The specific region, neighborhood, or street provided by the patient (e.g., 'Avenue Habib Bourguiba', 'Menzah 6').",
+								"The patient's neighbourhood, street or landmark inside the city (e.g. 'Menzah 6', 'Avenue Habib Bourguiba', 'near Hôpital Habib Bourguiba'). Never just the city name.",
 						},
 					},
 					required: ["city", "query"],

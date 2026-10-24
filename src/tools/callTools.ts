@@ -594,12 +594,14 @@ export class CallTools {
 				break;
 			}
 			case "list_my_ai_appointments": {
-				const includeRecentPast =
+				// Defaults to true, as the tool schema says.
+				const includeRecentPast = !(
 					parsedArgs !== null &&
 					typeof parsedArgs === "object" &&
 					!Array.isArray(parsedArgs) &&
 					(parsedArgs as { include_recent_past?: boolean })
-						.include_recent_past === true;
+						.include_recent_past === false
+				);
 				result = await this.listMyAiAppointments({ includeRecentPast });
 				break;
 			}
@@ -659,6 +661,23 @@ export class CallTools {
 	}
 
 	private async searchLocation(city: string, query: string): Promise<string> {
+		// A city alone is too broad to find the nearest doctors: ask for the area first.
+		const queryCity = findCityByName(query);
+		if (queryCity) {
+			return JSON.stringify({
+				found: false,
+				cityOnly: true,
+				city: {
+					en_name: queryCity.en_name,
+					fr_name: queryCity.fr_name,
+					ar_name: queryCity.ar_name,
+					latitude: queryCity.latitude,
+					longitude: queryCity.longitude,
+				},
+				message:
+					"This is only a city. Ask the patient once for their neighbourhood, street or a landmark near them in this city, then search again. If they cannot give one, use these city coordinates.",
+			});
+		}
 		try {
 			const cityMatch = findCityByName(city);
 			// The Next app picks the provider (GEO_PROVIDER); we only ask for places.
@@ -1032,9 +1051,11 @@ export class CallTools {
 
 	/** Name the call after the caller only when the booking is for the caller themselves. */
 	private callerNameIfSelf(patient: BookingPatient): { callerName?: string } {
-		return patient.personId != null && patient.personId === this.ctx.personId
-			? { callerName: bookingPatientName(patient) }
-			: {};
+		const isOwner =
+			patient.personId != null
+				? patient.personId === this.ctx.personId
+				: patient.relationship === undefined;
+		return isOwner ? { callerName: bookingPatientName(patient) } : {};
 	}
 
 	private async bookAppointment(
