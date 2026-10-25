@@ -95,7 +95,7 @@ function buildCallbackBlock(reason: CallbackReason): string {
 ## OUTBOUND CALLBACK (YOU CALLED THE PATIENT)
 You, Riaya, placed this call because ${why}. The patient already has no appointment for that request.
 - You already explained this in your opening line. Do not repeat it, and do not ask for their phone number.
-- If they want another doctor, help them book one using the normal flow. Offer at most two options at a time and ask one question per turn.
+- If they want another doctor, help them book one using the normal flow.
 - If it is a wrong number (they never asked for an appointment), apologize briefly and call \`end_call\`. The caller may have booked for someone else (a child, a parent); that is not a wrong number.
 - If they decline or are no longer interested, thank them and call \`end_call\`.
 - If they ask something unrelated, answer briefly or help with a booking as usual.`;
@@ -195,9 +195,8 @@ function buildRefusalBlock(
 
 ## RECENT REQUEST NOT ACCEPTED (THIS CALLER)
 ${what.charAt(0).toUpperCase()}${what.slice(1)}. ${isCallback ? "You are calling them about it." : "The caller was told to call back and may be calling about it."}
-${isCallback ? "You already told them in the opening line. When they agree to another doctor, offer these alternatives (same speciality, near the same area), at most two at a time, one question only:" : `Do **not** mention this in the opening greeting. When the patient says they want an appointment, or asks what happened, say briefly that ${sayWhat}, then offer these alternatives (same speciality, near the same area) — present them like normal options, one question only:`}
+${isCallback ? "You already told them in the opening line. When they agree to another doctor, offer these alternatives (same speciality, near the same area), like normal options:" : `Do **not** mention this in the opening greeting. When the patient says they want an appointment, or asks what happened, say briefly that ${sayWhat}, then offer these alternatives (same speciality, near the same area), like normal options:`}
 ${doctors}${sameRequest}
-- Names: Arabic pronunciation (see language rules).
 - If the patient picks one, call \`book_appointment\` with that exact \`doctor_id\` and the listed slot's start and end as \`start\` / \`end\` (you may first call \`find_doctor_slots\` if they want another time).
 - If they want a different speciality, location, or a specific doctor by name, follow the normal flow / \`find_doctor_by_name\`.
 - Never invent doctors or times beyond this list and tool results.`;
@@ -288,7 +287,6 @@ export function buildCallInstructions(
 
 ## CALLER PROFILE
 ${profileBlock}
-Do **not** mention existing appointments in the opening greeting. Use \`list_my_ai_appointments\` only when the patient asks about a booking, doctor, location, time, or cancellation.
 
 ${buildLanguageBlock(profile.savedLanguage)}`;
 

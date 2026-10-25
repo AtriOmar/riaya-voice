@@ -98,7 +98,6 @@ export type SystemMessageTool = {
 
 export type SystemMessage = {
 	type: string;
-	initialInstructions: string;
 	message: string;
 	tools: SystemMessageTool[];
 };
