@@ -161,7 +161,12 @@ type FindAvailableSlotsArgs = {
 	latitude: number;
 	longitude: number;
 	preferredTime?: string;
+	/** Doctors already offered, left out so a new search brings other doctors. */
+	excludeDoctorIds?: number[];
 };
+
+/** Doctors returned per search: three pairs, since the AI offers 2 at a time. */
+const SLOT_SEARCH_RESULTS = 6;
 
 type FindDoctorSlotsArgs = {
 	doctorId: number;
@@ -290,11 +295,16 @@ function normalizeFindAvailableSlotsArgs(
 	const longitude = numField(o, "longitude", "longitude");
 	const preferredTime = strField(o, "preferred_time", "preferredTime");
 	if (latitude === undefined || longitude === undefined) return null;
+	const excludeRaw = o.exclude_doctor_ids ?? o.excludeDoctorIds;
+	const excludeDoctorIds = Array.isArray(excludeRaw)
+		? excludeRaw.map(Number).filter((id) => Number.isInteger(id) && id > 0)
+		: [];
 	return {
 		specialitySlug,
 		latitude,
 		longitude,
 		...(preferredTime !== undefined ? { preferredTime } : {}),
+		...(excludeDoctorIds.length > 0 ? { excludeDoctorIds } : {}),
 	};
 }
 
@@ -752,20 +762,18 @@ export class CallTools {
 		}
 	}
 
-	private async findAvailableSlots(params: {
-		specialitySlug: string;
-		latitude: number;
-		longitude: number;
-		preferredTime?: string;
-	}): Promise<string> {
+	private async findAvailableSlots(
+		params: FindAvailableSlotsArgs,
+	): Promise<string> {
 		this.searchPlace = this.placeAt(params.latitude, params.longitude);
 		const path = "/api/doctors/best-fit";
-		// Next route expects query keys: speciality, lat, long, time
+		// Next route expects query keys: speciality, lat, long, time, exclude
 		const query = {
 			speciality: params.specialitySlug,
 			lat: params.latitude,
 			long: params.longitude,
 			time: params.preferredTime,
+			exclude: params.excludeDoctorIds?.join(","),
 		};
 
 		console.log(
@@ -792,13 +800,14 @@ export class CallTools {
 			);
 			return JSON.stringify({
 				found: false,
-				message:
-					"No doctors with available slots were found for this speciality and location.",
+				message: params.excludeDoctorIds
+					? "No other doctors with available slots were found for this speciality and location, besides the ones already offered."
+					: "No doctors with available slots were found for this speciality and location.",
 			});
 		}
 
-		// Return top 3 for the AI (doctorId = doctorProfile.id for book_appointment)
-		const top = data.slice(0, 3).map((doc) => ({
+		// Best first (doctorId = doctorProfile.id for book_appointment)
+		const top = data.slice(0, SLOT_SEARCH_RESULTS).map((doc) => ({
 			doctorId: doc.id,
 			name: `Dr. ${doc.firstName} ${doc.lastName}`,
 			cabinet: doc.cabinetName,
@@ -1297,6 +1306,10 @@ export class CallTools {
 			success: true,
 			found: true,
 			emergency_group_id: data.emergencyGroupId,
+			// Any one of these cancels the whole group if the patient changes their mind.
+			appointment_ids: data.appointments.flatMap((a) =>
+				a.id != null ? [a.id] : [],
+			),
 			patient_person_id: data.appointments[0]?.personId,
 			count: data.appointments.length,
 			doctors: data.doctors,
