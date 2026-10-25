@@ -67,6 +67,8 @@ export type RefusedPatient = {
 };
 
 export type CallerRefusalContext = {
+	/** A doctor refused the request, or nobody accepted it in time. */
+	reason: "refused" | "timeout";
 	refusedDoctorName: string | null;
 	suggestions: RefusalSuggestion[];
 	patient: RefusedPatient | null;
@@ -84,6 +86,7 @@ export async function getCallerRefusalContext(
 	try {
 		const { data } = await nextjsApi.post<{
 			found: boolean;
+			reason?: "refused" | "timeout" | null;
 			refusedDoctorName: string | null;
 			suggestions: RefusalSuggestion[];
 			patient?: RefusedPatient | null;
@@ -95,6 +98,7 @@ export async function getCallerRefusalContext(
 		);
 		if (!data.found || data.suggestions.length === 0) return null;
 		return {
+			reason: data.reason ?? "refused",
 			refusedDoctorName: data.refusedDoctorName,
 			suggestions: data.suggestions,
 			patient: data.patient ?? null,

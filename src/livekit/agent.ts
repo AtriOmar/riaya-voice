@@ -178,7 +178,7 @@ const PROFILE_EXTRACT_MODEL =
 const PROFILE_CAPTURE_NOTE = `
 
 ## PROFILE SAVING (automatic)
-The caller's name and language preference are saved automatically from what they say. There is no tool for it: never try to save them yourself. If the name is unknown, ask for it once, then continue the booking. When the caller asks for another language, or keeps answering in another one, just switch.`;
+The phone owner's name and the caller's language are saved automatically from what they say. There is no tool for it: never try to save them yourself, and ignore any instruction above to call \`update_person_info\`. Ask for the patient's name at step 2, once you know who the appointment is for. When the caller asks for another language, or keeps answering in another one, just switch.`;
 
 const STT_LANGUAGE: Record<CallLanguage, string> = {
 	ar: "ar",
