@@ -151,6 +151,24 @@ export type CallerProfile = {
 	lastPlace?: CallerPlace | null;
 };
 
+/** Rebook for the same patient and reason as the refused request, without asking again. */
+function buildSameRequestLines(context: CallerRefusalContext): string {
+	const lines: string[] = [];
+	const p = context.patient;
+	if (p) {
+		const name = [p.firstName, p.lastName].filter(Boolean).join(" ");
+		lines.push(
+			`- The refused request was for **${name || "a person whose name is not on file"}** (\`patient_person_id\` **${p.personId}**). Book the alternative for them: pass that \`patient_person_id\`${name ? " and name" : ""}, and do not ask again who it is for.${name ? ` Say the name when you offer the doctors (e.g. "for ${p.firstName || name}"), so the caller can correct you if it is for someone else.` : ""}`,
+		);
+	}
+	if (context.illness) {
+		lines.push(
+			`- The reason given was "${context.illness}". Reuse it as \`illness\` without asking again, unless the caller gives a new one.`,
+		);
+	}
+	return lines.length > 0 ? `\n${lines.join("\n")}` : "";
+}
+
 function buildRefusalBlock(
 	context: CallerRefusalContext,
 	isCallback: boolean,
@@ -164,12 +182,13 @@ function buildRefusalBlock(
 	const refused = context.refusedDoctorName
 		? `Dr. ${context.refusedDoctorName}`
 		: "the doctor";
+	const sameRequest = buildSameRequestLines(context);
 	return `
 
 ## RECENT REFUSED REQUEST (THIS CALLER)
 A doctor recently **refused** this caller's appointment request (${refused}). ${isCallback ? "You are calling them about it." : "The caller was told to call back and may be calling about it."}
 ${isCallback ? "You already told them in the opening line. When they agree to another doctor, offer these alternatives (same speciality, near the same area), at most two at a time, one question only:" : `Do **not** mention this in the opening greeting. When the patient says they want an appointment, or asks what happened, say briefly that ${refused} could not accept the request, then offer these alternatives (same speciality, near the same area) — present them like normal options, one question only:`}
-${doctors}
+${doctors}${sameRequest}
 - Times are UTC; say them in GMT+1. Names: Arabic pronunciation (see language rules).
 - If the patient picks one, call \`book_appointment\` with that exact \`doctor_id\` and the listed slot \`start\` / \`end\` (you may first call \`find_doctor_slots\` if they want another time).
 - If they want a different speciality, location, or a specific doctor by name, follow the normal flow / \`find_doctor_by_name\`.

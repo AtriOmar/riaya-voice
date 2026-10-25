@@ -59,9 +59,19 @@ export type RefusalSuggestion = {
 	slotEnd: string;
 };
 
+/** Who the refused request was for: someone on the calling phone. */
+export type RefusedPatient = {
+	personId: number;
+	firstName: string | null;
+	lastName: string | null;
+};
+
 export type CallerRefusalContext = {
 	refusedDoctorName: string | null;
 	suggestions: RefusalSuggestion[];
+	patient: RefusedPatient | null;
+	/** The reason for the visit given in the refused request. */
+	illness: string | null;
 };
 
 /**
@@ -76,6 +86,8 @@ export async function getCallerRefusalContext(
 			found: boolean;
 			refusedDoctorName: string | null;
 			suggestions: RefusalSuggestion[];
+			patient?: RefusedPatient | null;
+			illness?: string | null;
 		}>(
 			"/api/internal/caller/refusal-context",
 			{ phoneNumber: callerPhone.trim() },
@@ -85,6 +97,8 @@ export async function getCallerRefusalContext(
 		return {
 			refusedDoctorName: data.refusedDoctorName,
 			suggestions: data.suggestions,
+			patient: data.patient ?? null,
+			illness: data.illness ?? null,
 		};
 	} catch (err) {
 		console.error(
