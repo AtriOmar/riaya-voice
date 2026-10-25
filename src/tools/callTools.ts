@@ -1266,7 +1266,7 @@ export class CallTools {
 				found: false,
 				message:
 					data.message ??
-					"No nearby doctors available for an urgent booking right now.",
+					"No nearby doctor has a free slot in the next few hours, so no urgent request was sent.",
 			});
 		}
 
@@ -1302,7 +1302,7 @@ export class CallTools {
 			doctors: data.doctors,
 			message:
 				data.message ??
-				"Urgent requests sent to nearby doctors. The first to accept keeps the appointment.",
+				"Urgent requests sent to nearby doctors. The first to accept keeps the appointment; if none accepts within a few minutes, more doctors are asked.",
 		});
 	}
 

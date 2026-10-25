@@ -100,9 +100,16 @@ You, Riaya, placed this call because ${why}. The patient already has no appointm
 - If they ask something unrelated, answer briefly or help with a booking as usual.`;
 }
 
+/** Language of a call when the caller has none saved. */
+export const DEFAULT_CALL_LANGUAGE: CallLanguage = "ar";
+
+/** The language if `raw` is one we support, else null (nothing saved). */
+export function parseCallLanguage(raw: unknown): CallLanguage | null {
+	return raw === "en" || raw === "fr" || raw === "ar" ? raw : null;
+}
+
 export function normalizeCallLanguage(raw: unknown): CallLanguage {
-	if (raw === "en" || raw === "fr" || raw === "ar") return raw;
-	return "ar";
+	return parseCallLanguage(raw) ?? DEFAULT_CALL_LANGUAGE;
 }
 
 /**
@@ -130,7 +137,8 @@ export function buildHangupToolResult(
 }
 
 export type CallerProfile = {
-	language: CallLanguage;
+	/** The caller's saved language; null when none is saved yet. */
+	savedLanguage: CallLanguage | null;
 	firstName?: string | null;
 	callerPhone?: string | null;
 	/** Everyone on the caller's phone (owner first); who an appointment can be for. */
@@ -223,13 +231,25 @@ People already known on this phone. Use their \`patient_person_id\` when booking
 ${lines}`;
 }
 
+const MIXING_IS_NOT_A_SWITCH =
+	"Mixing a few French or English words into Derja is normal and is **not** a switch.";
+
+function buildLanguageBlock(saved: CallLanguage | null): string {
+	if (saved) {
+		return `## CALLER LANGUAGE
+Saved language for this caller: **${saved}** (${LANGUAGE_LABEL[saved]}). **Start and respond in it.**
+If the caller asks for another language (English, French or Tunisian Derja), or keeps answering in another one, switch right away and call \`update_person_info\` with \`preferred_language\` (\`en\`, \`fr\`, or \`ar\` for Derja). ${MIXING_IS_NOT_A_SWITCH} Never call the tool for the saved language.`;
+	}
+	return `## CALLER LANGUAGE
+No language is saved for this caller yet. You greet in Tunisian Derja; then reply in the language the caller answers in (English, French or Tunisian Derja). ${MIXING_IS_NOT_A_SWITCH}
+Save it **once**, as soon as it is clear: add \`preferred_language\` (\`en\`, \`fr\`, or \`ar\` for Derja) to your first \`update_person_info\` call (usually the one that saves their name), or call it with just \`preferred_language\` if you have nothing else to save. After that, call it again only if the caller switches language.`;
+}
+
 /** Full session instructions: base system prompt + caller profile / language / phone blocks. */
 export function buildCallInstructions(
 	systemPrompt: string,
 	profile: CallerProfile,
 ): string {
-	const lang = profile.language;
-	const langLabel = LANGUAGE_LABEL[lang];
 	const knownName = profile.firstName?.trim();
 	const profileBlock = knownName
 		? `Known first name: **${knownName}** (use in greeting; you may skip asking for name unless unclear).`
@@ -240,9 +260,7 @@ export function buildCallInstructions(
 ${profileBlock}
 Do **not** mention existing appointments in the opening greeting. Use \`list_my_ai_appointments\` only when the patient asks about a booking, doctor, location, time, or cancellation.
 
-## CALLER LANGUAGE PREFERENCE
-Stored preference for this caller: **${lang}** (${langLabel}). **Start and respond in this language** until the patient asks to switch.
-If they ask to speak a language **different from ${lang}** (English, French, or Tunisian Derja), switch immediately and call \`update_person_info\` with \`preferred_language\` set to \`en\`, \`fr\`, or \`ar\` (use \`ar\` for Tunisian Derja). Mixing a few French or English words into Derja is normal and is **not** a language switch; do not call the tool for it.`;
+${buildLanguageBlock(profile.savedLanguage)}`;
 
 	const callback = profile.callbackReason
 		? buildCallbackBlock(profile.callbackReason)

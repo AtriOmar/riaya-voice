@@ -181,18 +181,35 @@ export const pendingTimeoutWorker = new Worker(
 			job.data,
 		);
 
-		const { success, reason, notified, phone, adminId, whatsappMessage } =
-			response.data as {
-				success: boolean;
-				reason?: string;
-				notified?: boolean;
-				phone?: string;
-				adminId?: string | null;
-				whatsappMessage?: string;
-			};
+		const {
+			success,
+			reason,
+			notified,
+			phone,
+			adminId,
+			whatsappMessage,
+			nextWave,
+		} = response.data as {
+			success: boolean;
+			reason?: string;
+			notified?: boolean;
+			phone?: string;
+			adminId?: string | null;
+			whatsappMessage?: string;
+			/** Urgent requests: nobody answered, so this wave of doctors was asked next. */
+			nextWave?: number;
+		};
 
 		if (!success) {
 			logger.info({ reason }, "[PendingTimeout] Job skipped");
+			return;
+		}
+
+		if (nextWave != null) {
+			logger.info(
+				{ emergencyGroupId: job.data?.emergencyGroupId, nextWave },
+				"[PendingTimeout] Urgent requests sent to the next wave of doctors",
+			);
 			return;
 		}
 
