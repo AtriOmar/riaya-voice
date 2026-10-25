@@ -8,6 +8,8 @@
  * background, so the conversation model never waits on it.
  */
 
+import type { CallLanguage } from "../sessions/callInstructions.js";
+
 const ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
 
 export type ProfileFindings = {
@@ -18,12 +20,21 @@ export type ProfileFindings = {
 
 const LANGUAGES = new Set(["en", "fr", "ar"]);
 
-function buildSystemPrompt(currentLanguage: string) {
+const NOT_A_SWITCH =
+	"Mixing a few French or English words into Derja is NOT a switch.";
+
+function languageRule(savedLanguage: CallLanguage | null): string {
+	return savedLanguage
+		? `preferred_language: only if the caller asks to switch to a different language than the saved one (${savedLanguage}; ar = Tunisian Derja), or answers in full sentences in another language. ${NOT_A_SWITCH} Otherwise null.`
+		: `preferred_language: no language is saved yet, so give the language the caller speaks in this message (en, fr, or ar for Tunisian Derja), when it is clear. ${NOT_A_SWITCH} Otherwise null.`;
+}
+
+function buildSystemPrompt(savedLanguage: CallLanguage | null) {
 	return [
 		"You extract facts from one turn of a phone call to a doctor-appointment line in Tunisia.",
 		'Reply with JSON only: {"first_name": string|null, "last_name": string|null, "preferred_language": "en"|"fr"|"ar"|null}.',
-		"first_name / last_name: only if the caller says THEIR OWN name in this message (introducing themselves, or answering a question about their name). Never a doctor's, city's or speciality name, and never a name that is not the caller's. Keep it as spoken; write Arabic names in Arabic script. If only one name is given, put it in first_name.",
-		`preferred_language: only if the caller EXPLICITLY asks to switch the conversation to a different language than the current one (${currentLanguage}; ar = Tunisian Derja). Mixing a few French or English words into Derja is NOT a switch. Otherwise null.`,
+		"first_name / last_name: only if the caller says THEIR OWN name in this message (introducing themselves, or answering a question about their name). Never a doctor's, city's or speciality name, and never a name that is not the caller's. Keep it as spoken; write Arabic names in Arabic script. If only one name is given, put it in first_name. These names are saved as the phone owner's, so use null when the caller says this is someone else's phone (e.g. their husband's or mother's).",
+		languageRule(savedLanguage),
 		"Use null for anything not clearly present.",
 	].join(" ");
 }
@@ -33,7 +44,8 @@ export async function extractProfile(opts: {
 	model: string;
 	assistantText: string;
 	callerText: string;
-	currentLanguage: string;
+	/** The caller's saved language; null when none is saved yet. */
+	savedLanguage: CallLanguage | null;
 	signal?: AbortSignal;
 }): Promise<ProfileFindings> {
 	const res = await fetch(ENDPOINT, {
@@ -46,7 +58,7 @@ export async function extractProfile(opts: {
 			model: opts.model,
 			response_format: { type: "json_object" },
 			messages: [
-				{ role: "system", content: buildSystemPrompt(opts.currentLanguage) },
+				{ role: "system", content: buildSystemPrompt(opts.savedLanguage) },
 				{
 					role: "user",
 					content: `Assistant said: "${opts.assistantText}"\nCaller said: "${opts.callerText}"`,

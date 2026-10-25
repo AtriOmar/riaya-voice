@@ -15,7 +15,6 @@ import { type WebSocket, WebSocketServer } from "ws";
 import { isCallerBlocked } from "./api/abuseApi.js";
 import { startCallRecording } from "./api/callRecording.js";
 import { ensureCallRow } from "./api/callsApi.js";
-import { nextjsApi } from "./api/nextjsApiClient.js";
 import { ensurePersonRow } from "./api/personsApi.js";
 import { registerTestCallInbox } from "./services/testCallInbox.js";
 import { whatsappManager } from "./services/whatsappManager.js";
@@ -103,21 +102,15 @@ app.post("/whatsapp-logout", async (req: Request, res: Response) => {
 // Body: { userId, phone, message?, documentUrl?, fileName?, mimetype? }
 // Plan limits are enforced by the web route before it calls this.
 app.post("/send-whatsapp", async (req: Request, res: Response) => {
-	const {
-		userId,
-		phone,
-		message,
-		documentUrl,
-		fileName,
-		mimetype,
-	} = req.body as {
-		userId?: string;
-		phone?: string;
-		message?: string;
-		documentUrl?: string;
-		fileName?: string;
-		mimetype?: string;
-	};
+	const { userId, phone, message, documentUrl, fileName, mimetype } =
+		req.body as {
+			userId?: string;
+			phone?: string;
+			message?: string;
+			documentUrl?: string;
+			fileName?: string;
+			mimetype?: string;
+		};
 	if (!phone) {
 		res.status(400).json({ error: "phone is required" });
 		return;

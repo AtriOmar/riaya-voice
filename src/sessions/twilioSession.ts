@@ -43,8 +43,10 @@ import {
 	buildWatchdogInstructions,
 	type CallbackReason,
 	type CallLanguage,
+	DEFAULT_CALL_LANGUAGE,
 	normalizeCallbackReason,
 	normalizeCallLanguage,
+	parseCallLanguage,
 	type WatchdogPrompt,
 } from "./callInstructions.js";
 import { CallerVoiceDetector, CallWatchdog } from "./callWatchdog.js";
@@ -98,9 +100,14 @@ export class TwilioSession {
 	private twilioStreamStarted = false;
 	/** Loaded from person row (or default ar) before first greeting when possible. */
 	private personProfileResolved = false;
-	/** Saved preference + active call language (default Arabic). */
-	private callerPreferredLanguage: CallLanguage = "ar";
+	/** The caller's saved language; null when none is saved yet. */
+	private savedLanguage: CallLanguage | null = null;
 	private callerFirstName: string | null = null;
+
+	/** Language this call runs in: the saved one, else the default. */
+	private get callLanguage(): CallLanguage {
+		return this.savedLanguage ?? DEFAULT_CALL_LANGUAGE;
+	}
 
 	/** Next.js DB row id for this call (available once ensureCallRow resolves). */
 	private dbCallIdPromise: Promise<number | null> | null = null;
@@ -241,7 +248,7 @@ export class TwilioSession {
 			applyPersonRow: (row) => this.applyPersonRow(row),
 			onProfileChange: ({ firstName, preferredLanguage }) => {
 				if (firstName) this.callerFirstName = firstName;
-				if (preferredLanguage) this.callerPreferredLanguage = preferredLanguage;
+				if (preferredLanguage) this.savedLanguage = preferredLanguage;
 				this.sendSessionConfig();
 			},
 			emit: (message) => this.broadcastDashboard(message),
@@ -279,7 +286,7 @@ export class TwilioSession {
 
 	private buildSessionInstructions(): string {
 		return buildCallInstructions(this.systemMessage.message, {
-			language: this.callerPreferredLanguage,
+			savedLanguage: this.savedLanguage,
 			firstName: this.callerFirstName,
 			callerPhone: this.callerPhone,
 			people: this.peopleOnLine,
@@ -297,12 +304,12 @@ export class TwilioSession {
 	}) {
 		this.personId = row.id;
 		this.callerFirstName = row.firstName?.trim() || null;
-		this.callerPreferredLanguage = normalizeCallLanguage(row.preferredLanguage);
+		this.savedLanguage = parseCallLanguage(row.preferredLanguage);
 		this.personProfileResolved = true;
 		this.logger.info(
 			{
 				personId: row.id,
-				preferredLanguage: this.callerPreferredLanguage,
+				savedLanguage: this.savedLanguage,
 				hasFirstName: Boolean(this.callerFirstName),
 			},
 			"👤 Person profile applied",
@@ -325,24 +332,24 @@ export class TwilioSession {
 			{
 				instructions: this.buildSessionInstructions(),
 				tools: this.systemMessage.tools,
-				language: this.callerPreferredLanguage,
+				language: this.callLanguage,
 				firstName: this.callerFirstName,
 			},
 			this.callbackReason
 				? buildCallbackGreetingInstructions({
-						lang: this.callerPreferredLanguage,
+						lang: this.callLanguage,
 						firstName: this.callerFirstName,
 						reason: this.callbackReason,
 						refusedDoctorName: this.refusalContext?.refusedDoctorName,
 					})
 				: buildInitialGreetingInstructions(
-						this.callerPreferredLanguage,
+						this.callLanguage,
 						this.callerFirstName,
 					),
 		);
 		this.logger.info(
 			{
-				language: this.callerPreferredLanguage,
+				language: this.callLanguage,
 				hasCallerPhone: Boolean(this.callerPhone),
 			},
 			"🗣️ Session started, initial greeting triggered",
@@ -356,7 +363,7 @@ export class TwilioSession {
 		this.provider?.updateSession({
 			instructions: this.buildSessionInstructions(),
 			tools: this.systemMessage.tools,
-			language: this.callerPreferredLanguage,
+			language: this.callLanguage,
 			firstName: this.callerFirstName,
 		});
 	}
@@ -661,9 +668,7 @@ export class TwilioSession {
 	// ==================== Watchdog (silence / time limit) ====================
 
 	private promptAssistant(prompt: WatchdogPrompt) {
-		this.provider?.prompt(
-			buildWatchdogInstructions(prompt, this.callerPreferredLanguage),
-		);
+		this.provider?.prompt(buildWatchdogInstructions(prompt, this.callLanguage));
 	}
 
 	/** Say one goodbye line, then hang up the same way `end_call` does. */

@@ -3,6 +3,7 @@
 import type { CallerRefusalContext } from "../api/callerAppointmentsApi.js";
 import type { PersonOnLine } from "../api/callerPeopleApi.js";
 import type { CallerPlace } from "../api/callerPlaceApi.js";
+import { localSlot, toTunisLocal } from "../utils/tunisTime.js";
 
 export type CallLanguage = "en" | "fr" | "ar";
 
@@ -94,15 +95,22 @@ function buildCallbackBlock(reason: CallbackReason): string {
 ## OUTBOUND CALLBACK (YOU CALLED THE PATIENT)
 You, Riaya, placed this call because ${why}. The patient already has no appointment for that request.
 - You already explained this in your opening line. Do not repeat it, and do not ask for their phone number.
-- If they want another doctor, help them book one using the normal flow. Offer at most two options at a time and ask one question per turn.
+- If they want another doctor, help them book one using the normal flow.
 - If it is a wrong number (they never asked for an appointment), apologize briefly and call \`end_call\`. The caller may have booked for someone else (a child, a parent); that is not a wrong number.
 - If they decline or are no longer interested, thank them and call \`end_call\`.
 - If they ask something unrelated, answer briefly or help with a booking as usual.`;
 }
 
+/** Language of a call when the caller has none saved. */
+export const DEFAULT_CALL_LANGUAGE: CallLanguage = "ar";
+
+/** The language if `raw` is one we support, else null (nothing saved). */
+export function parseCallLanguage(raw: unknown): CallLanguage | null {
+	return raw === "en" || raw === "fr" || raw === "ar" ? raw : null;
+}
+
 export function normalizeCallLanguage(raw: unknown): CallLanguage {
-	if (raw === "en" || raw === "fr" || raw === "ar") return raw;
-	return "ar";
+	return parseCallLanguage(raw) ?? DEFAULT_CALL_LANGUAGE;
 }
 
 /**
@@ -130,7 +138,8 @@ export function buildHangupToolResult(
 }
 
 export type CallerProfile = {
-	language: CallLanguage;
+	/** The caller's saved language; null when none is saved yet. */
+	savedLanguage: CallLanguage | null;
 	firstName?: string | null;
 	callerPhone?: string | null;
 	/** Everyone on the caller's phone (owner first); who an appointment can be for. */
@@ -143,6 +152,24 @@ export type CallerProfile = {
 	lastPlace?: CallerPlace | null;
 };
 
+/** Rebook for the same patient and reason as the request not accepted, without asking again. */
+function buildSameRequestLines(context: CallerRefusalContext): string {
+	const lines: string[] = [];
+	const p = context.patient;
+	if (p) {
+		const name = [p.firstName, p.lastName].filter(Boolean).join(" ");
+		lines.push(
+			`- The request was for **${name || "a person whose name is not on file"}** (\`patient_person_id\` **${p.personId}**). Book the alternative for them: pass that \`patient_person_id\`${name ? " and name" : ""}, and do not ask again who it is for.${name ? ` Say the name when you offer the doctors (e.g. "for ${p.firstName || name}"), so the caller can correct you if it is for someone else.` : ""}`,
+		);
+	}
+	if (context.illness) {
+		lines.push(
+			`- The reason given was "${context.illness}". Reuse it as \`illness\` without asking again, unless the caller gives a new one.`,
+		);
+	}
+	return lines.length > 0 ? `\n${lines.join("\n")}` : "";
+}
+
 function buildRefusalBlock(
 	context: CallerRefusalContext,
 	isCallback: boolean,
@@ -150,25 +177,37 @@ function buildRefusalBlock(
 	const doctors = context.suggestions
 		.map(
 			(s, i) =>
-				`${i + 1}. doctor_id **${s.doctorId}** — ${s.name}${s.cabinetName ? `, ${s.cabinetName}` : ""}${s.address ? `, ${s.address}` : ""} (~${s.distanceKm} km); first slot start \`${s.slotStart}\`, end \`${s.slotEnd}\``,
+				`${i + 1}. doctor_id **${s.doctorId}** — ${s.name}${s.cabinetName ? `, ${s.cabinetName}` : ""}${s.address ? `, ${s.address}` : ""} (~${s.distanceKm} km); first slot ${slotLine(s)}`,
 		)
 		.join("\n");
 	const refused = context.refusedDoctorName
 		? `Dr. ${context.refusedDoctorName}`
 		: "the doctor";
+	const timedOut = context.reason === "timeout";
+	const what = timedOut
+		? "no doctor confirmed this caller's recent appointment request in time, so it was cancelled"
+		: `a doctor recently **refused** this caller's appointment request (${refused})`;
+	const sayWhat = timedOut
+		? "no doctor could confirm the request in time"
+		: `${refused} could not accept the request`;
+	const sameRequest = buildSameRequestLines(context);
 	return `
 
-## RECENT REFUSED REQUEST (THIS CALLER)
-A doctor recently **refused** this caller's appointment request (${refused}). ${isCallback ? "You are calling them about it." : "The caller was told to call back and may be calling about it."}
-${isCallback ? "You already told them in the opening line. When they agree to another doctor, offer these alternatives (same speciality, near the same area), at most two at a time, one question only:" : `Do **not** mention this in the opening greeting. When the patient says they want an appointment, or asks what happened, say briefly that ${refused} could not accept the request, then offer these alternatives (same speciality, near the same area) — present them like normal options, one question only:`}
-${doctors}
-- Times are UTC; say them in GMT+1. Names: Arabic pronunciation (see language rules).
-- If the patient picks one, call \`book_appointment\` with that exact \`doctor_id\` and the listed slot \`start\` / \`end\` (you may first call \`find_doctor_slots\` if they want another time).
+## RECENT REQUEST NOT ACCEPTED (THIS CALLER)
+${what.charAt(0).toUpperCase()}${what.slice(1)}. ${isCallback ? "You are calling them about it." : "The caller was told to call back and may be calling about it."}
+${isCallback ? "You already told them in the opening line. When they agree to another doctor, offer these alternatives (same speciality, near the same area), like normal options:" : `Do **not** mention this in the opening greeting. When the patient says they want an appointment, or asks what happened, say briefly that ${sayWhat}, then offer these alternatives (same speciality, near the same area), like normal options:`}
+${doctors}${sameRequest}
+- If the patient picks one, call \`book_appointment\` with that exact \`doctor_id\` and the listed slot's start and end as \`start\` / \`end\` (you may first call \`find_doctor_slots\` if they want another time).
 - If they want a different speciality, location, or a specific doctor by name, follow the normal flow / \`find_doctor_by_name\`.
 - Never invent doctors or times beyond this list and tool results.`;
 }
 
-/** Tunisia has no daylight saving time, so local time is always UTC+1. */
+/** A suggested slot in Tunisia local time, as the assistant reads it. */
+function slotLine(s: { slotStart: string; slotEnd: string }): string {
+	const slot = localSlot({ start: s.slotStart, end: s.slotEnd });
+	return `${slot.when}: start \`${slot.slotStart}\`, end \`${slot.slotEnd}\``;
+}
+
 function buildCurrentTimeBlock(now: Date = new Date()): string {
 	const local = new Intl.DateTimeFormat("en-GB", {
 		timeZone: "Africa/Tunis",
@@ -176,15 +215,13 @@ function buildCurrentTimeBlock(now: Date = new Date()): string {
 		day: "numeric",
 		month: "long",
 		year: "numeric",
-		hour: "2-digit",
-		minute: "2-digit",
-		hour12: false,
 	}).format(now);
+	const clock = toTunisLocal(now);
 	return `
 
 ## CURRENT DATE AND TIME
-Now in Tunisia (GMT+1): **${local}**. In UTC: \`${now.toISOString()}\`.
-Use this for "today", "tomorrow", weekdays, and as \`preferred_time\` when the patient has no preference.`;
+Now in Tunisia: **${local}, ${clock.slice(11)}** (\`${clock}\`).
+Use this for "today", "tomorrow" and weekdays, and as \`preferred_time\` when the patient has no preference.`;
 }
 
 const RELATIONSHIP_LABEL: Record<PersonOnLine["relationship"], string> = {
@@ -223,26 +260,35 @@ People already known on this phone. Use their \`patient_person_id\` when booking
 ${lines}`;
 }
 
+const MIXING_IS_NOT_A_SWITCH =
+	"Mixing a few French or English words into Derja is normal and is **not** a switch.";
+
+function buildLanguageBlock(saved: CallLanguage | null): string {
+	if (saved) {
+		return `## CALLER LANGUAGE
+Saved language for this caller: **${saved}** (${LANGUAGE_LABEL[saved]}). **Start and respond in it.**
+If the caller asks for another language (English, French or Tunisian Derja), or keeps answering in another one, switch right away and call \`update_person_info\` with \`preferred_language\` (\`en\`, \`fr\`, or \`ar\` for Derja). ${MIXING_IS_NOT_A_SWITCH} Never call the tool for the saved language.`;
+	}
+	return `## CALLER LANGUAGE
+No language is saved for this caller yet. You greet in Tunisian Derja; then reply in the language the caller answers in (English, French or Tunisian Derja). ${MIXING_IS_NOT_A_SWITCH}
+Save it **once**, as soon as it is clear: add \`preferred_language\` (\`en\`, \`fr\`, or \`ar\` for Derja) to your first \`update_person_info\` call (usually the one that saves their name), or call it with just \`preferred_language\` if you have nothing else to save. After that, call it again only if the caller switches language.`;
+}
+
 /** Full session instructions: base system prompt + caller profile / language / phone blocks. */
 export function buildCallInstructions(
 	systemPrompt: string,
 	profile: CallerProfile,
 ): string {
-	const lang = profile.language;
-	const langLabel = LANGUAGE_LABEL[lang];
 	const knownName = profile.firstName?.trim();
 	const profileBlock = knownName
-		? `Known first name: **${knownName}** (use in greeting; you may skip asking for name unless unclear).`
-		: "Name not on file yet — ask for their name early in the booking flow.";
+		? `Known first name of the phone owner: **${knownName}** (used in the greeting). Do not ask for it again unless the caller says they are someone else.`
+		: "No name on file for the phone owner. Ask for the patient's name at step 2, once you know who the appointment is for.";
 	const instructions = `${systemPrompt}${buildCurrentTimeBlock()}
 
 ## CALLER PROFILE
 ${profileBlock}
-Do **not** mention existing appointments in the opening greeting. Use \`list_my_ai_appointments\` only when the patient asks about a booking, doctor, location, time, or cancellation.
 
-## CALLER LANGUAGE PREFERENCE
-Stored preference for this caller: **${lang}** (${langLabel}). **Start and respond in this language** until the patient asks to switch.
-If they ask to speak a language **different from ${lang}** (English, French, or Tunisian Derja), switch immediately and call \`update_person_info\` with \`preferred_language\` set to \`en\`, \`fr\`, or \`ar\` (use \`ar\` for Tunisian Derja). Mixing a few French or English words into Derja is normal and is **not** a language switch; do not call the tool for it.`;
+${buildLanguageBlock(profile.savedLanguage)}`;
 
 	const callback = profile.callbackReason
 		? buildCallbackBlock(profile.callbackReason)

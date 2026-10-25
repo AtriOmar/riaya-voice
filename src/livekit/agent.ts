@@ -35,8 +35,10 @@ import {
 	buildInitialGreetingInstructions,
 	buildWatchdogInstructions,
 	type CallLanguage,
+	DEFAULT_CALL_LANGUAGE,
 	LANGUAGE_LABEL,
 	normalizeCallLanguage,
+	parseCallLanguage,
 	type WatchdogPrompt,
 } from "../sessions/callInstructions.js";
 import { CallWatchdog } from "../sessions/callWatchdog.js";
@@ -176,7 +178,7 @@ const PROFILE_EXTRACT_MODEL =
 const PROFILE_CAPTURE_NOTE = `
 
 ## PROFILE SAVING (automatic)
-The caller's name and language preference are saved automatically from what they say. There is no tool for it: never try to save them yourself. If the name is unknown, ask for it once, then continue the booking. When the caller asks to switch language, just switch.`;
+The phone owner's name and the caller's language are saved automatically from what they say. There is no tool for it: never try to save them yourself, and ignore any instruction above to call \`update_person_info\`. Ask for the patient's name at step 2, once you know who the appointment is for. When the caller asks for another language, or keeps answering in another one, just switch.`;
 
 const STT_LANGUAGE: Record<CallLanguage, string> = {
 	ar: "ar",
@@ -413,7 +415,9 @@ export default defineAgent({
 
 		// ---------- per-call state ----------
 		let personId: number | null = null;
-		let language: CallLanguage = "ar";
+		let savedLanguage: CallLanguage | null = null;
+		/** Language this call runs in: the saved one, else the default. */
+		const callLanguage = () => savedLanguage ?? DEFAULT_CALL_LANGUAGE;
 		let firstName: string | null = null;
 		const callStartedAt = new Date();
 		let callEnded = false;
@@ -436,7 +440,7 @@ export default defineAgent({
 		const applyPersonRow = (row: PersonRow) => {
 			personId = row.id;
 			firstName = row.firstName?.trim() || null;
-			language = normalizeCallLanguage(row.preferredLanguage);
+			savedLanguage = parseCallLanguage(row.preferredLanguage);
 		};
 		let refusalContext: CallerRefusalContext | null = null;
 		let people: PersonOnLine[] = [];
@@ -456,7 +460,7 @@ export default defineAgent({
 
 		const instructions = () =>
 			buildCallInstructions(systemMessage.message, {
-				language,
+				savedLanguage,
 				firstName,
 				callerPhone,
 				people,
@@ -470,7 +474,7 @@ export default defineAgent({
 		const cfg = resolvePipeline(callSettings?.pipeline);
 		const sttHint =
 			STT_LANGUAGE_HINT === "call"
-				? (STT_LANGUAGE[language] as LanguageCode)
+				? (STT_LANGUAGE[callLanguage()] as LanguageCode)
 				: undefined;
 		// MAI and Gemini STT are whole-utterance (non-streaming): LiveKit wraps
 		// them with VAD and only has a transcript once the utterance is already
@@ -513,11 +517,11 @@ export default defineAgent({
 							? new OpenRouterTranscribeSTT({ model: cfg.whisperModel })
 							: cfg.sttModel === "mai"
 								? new MaiTranscribeSTT({
-										fallbackLanguage: STT_LANGUAGE[language],
+										fallbackLanguage: STT_LANGUAGE[callLanguage()],
 										phrases: MAI_PHRASES,
 									})
 								: cfg.sttModel === "inworld"
-									? new inworld.STT({ language: STT_LANGUAGE[language] })
+									? new inworld.STT({ language: STT_LANGUAGE[callLanguage()] })
 									: cfg.sttModel.startsWith("gpt-")
 										? new openai.STT({
 												model: cfg.sttModel,
@@ -566,7 +570,7 @@ export default defineAgent({
 									: new inworld.TTS({
 											model: cfg.inworldTtsModel,
 											voice: cfg.inworldVoice,
-											language: TTS_LANGUAGE[language],
+											language: TTS_LANGUAGE[callLanguage()],
 										});
 		const model = GPT_LIVE
 			? new openai.realtime.GPTLiveModel({
@@ -617,7 +621,7 @@ export default defineAgent({
 			onProfileChange: (change) => {
 				if (change.firstName) firstName = change.firstName;
 				if (change.preferredLanguage) {
-					language = change.preferredLanguage;
+					savedLanguage = change.preferredLanguage;
 					if (
 						stt instanceof GeminiTranscribeSTT ||
 						stt instanceof GoogleGeminiTranscribeSTT ||
@@ -625,18 +629,18 @@ export default defineAgent({
 					) {
 						// No language state: the prompt already covers all three languages.
 					} else if (stt instanceof MaiTranscribeSTT) {
-						stt.setFallbackLanguage(STT_LANGUAGE[language]);
+						stt.setFallbackLanguage(STT_LANGUAGE[callLanguage()]);
 					} else if (stt instanceof inworld.STT) {
-						stt.updateOptions({ language: STT_LANGUAGE[language] });
+						stt.updateOptions({ language: STT_LANGUAGE[callLanguage()] });
 					} else if (stt && STT_LANGUAGE_HINT === "call") {
 						// Inference STT types `language` as a branded code; ours is a plain BCP-47 string.
 						stt.updateOptions({
-							language: STT_LANGUAGE[language] as LanguageCode,
+							language: STT_LANGUAGE[callLanguage()] as LanguageCode,
 						});
 					}
 					// OpenRouter voices detect the language from the text; only Inworld needs a locale.
 					if (tts instanceof inworld.TTS) {
-						tts.updateOptions({ language: TTS_LANGUAGE[language] });
+						tts.updateOptions({ language: TTS_LANGUAGE[callLanguage()] });
 					}
 				}
 				if (GPT_LIVE) {
@@ -669,7 +673,7 @@ export default defineAgent({
 			setTimeout(() => hangUp("fallback"), END_CALL_MAX_WAIT_MS);
 			return buildHangupToolResult(
 				normalizeCallLanguage(
-					(args as { language?: string } | null)?.language ?? language,
+					(args as { language?: string } | null)?.language ?? callLanguage(),
 				),
 				reason,
 			);
@@ -803,14 +807,17 @@ export default defineAgent({
 			pendingHangup = true;
 			setTimeout(() => hangUp("fallback"), END_CALL_MAX_WAIT_MS);
 			session.generateReply({
-				instructions: buildWatchdogInstructions(prompt, language),
+				instructions: buildWatchdogInstructions(prompt, callLanguage()),
 				allowInterruptions: false,
 			});
 		};
 		const watchdog = new CallWatchdog(log, {
 			onAskStillThere: () =>
 				session.generateReply({
-					instructions: buildWatchdogInstructions("still_there", language),
+					instructions: buildWatchdogInstructions(
+						"still_there",
+						callLanguage(),
+					),
 				}),
 			onSilentGoodbye: () =>
 				endWithGoodbye(
@@ -862,7 +869,7 @@ export default defineAgent({
 						model: PROFILE_EXTRACT_MODEL,
 						assistantText,
 						callerText,
-						currentLanguage: language,
+						savedLanguage,
 						signal: profileAbort.signal,
 					});
 					const args: Record<string, string> = {};
@@ -875,7 +882,7 @@ export default defineAgent({
 					}
 					if (
 						found.preferred_language &&
-						found.preferred_language !== language
+						found.preferred_language !== savedLanguage
 					) {
 						args.preferred_language = found.preferred_language;
 					}
@@ -1031,7 +1038,7 @@ export default defineAgent({
 		}
 
 		session.generateReply({
-			instructions: buildInitialGreetingInstructions(language, firstName),
+			instructions: buildInitialGreetingInstructions(callLanguage(), firstName),
 		});
 		watchdog.start();
 	},
