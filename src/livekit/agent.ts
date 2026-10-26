@@ -831,11 +831,14 @@ export default defineAgent({
 				),
 		});
 		session.on(voice.AgentSessionEventTypes.UserStateChanged, (ev) => {
-			if (ev.newState === "speaking") watchdog.callerSpoke();
+			if (ev.newState !== "speaking") return;
+			watchdog.callerSpoke();
+			callTools.callerSpoke();
 		});
 		// thinking covers tool calls; listening means the reply has finished playing.
 		session.on(voice.AgentSessionEventTypes.AgentStateChanged, (ev) => {
 			watchdog.setAssistantSpeaking(ev.newState !== "listening");
+			if (ev.newState === "speaking") callTools.assistantSpoke();
 		});
 
 		// The reply that follows the end_call result is the goodbye; hang up once
