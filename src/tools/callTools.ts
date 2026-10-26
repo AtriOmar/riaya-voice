@@ -26,6 +26,7 @@ import {
 	toTunisLocal,
 	tunisLabel,
 } from "../utils/tunisTime.js";
+import { findPlaces, type PlaceSearchResult } from "./locationSearch.js";
 
 /**
  * Booking tools shared by every call path (Twilio media stream session and the
@@ -64,17 +65,6 @@ const CITY_SEARCH_RADIUS_M = 30_000;
 function placeKey(latitude: number, longitude: number): string {
 	return `${latitude.toFixed(4)},${longitude.toFixed(4)}`;
 }
-
-/** Row from `GET /api/internal/places/search` (see web `lib/geo`). */
-type PlaceSearchResult = {
-	id: string;
-	label: string;
-	lat: number | null;
-	lng: number | null;
-	city: string | null;
-	state: string | null;
-	street: string | null;
-};
 
 function normalizeCityName(raw: string): string {
 	return raw
@@ -779,37 +769,33 @@ export class CallTools {
 		try {
 			const cityMatch = findCityByName(city);
 			// The Next app picks the provider (GEO_PROVIDER); we only ask for places.
-			const search = async (
-				near?: { lat: number; lng: number },
-				radiusM?: number,
-			) =>
-				(
-					await nextjsApi.get<PlaceSearchResult[]>(
-						"/api/internal/places/search",
-						{
-							params: {
-								text: `${query}, ${city}`,
-								...(near ? { lat: near.lat, lng: near.lng } : {}),
-								...(radiusM ? { radiusM } : {}),
+			const search =
+				(near?: { lat: number; lng: number }, radiusM?: number) =>
+				async (text: string) =>
+					(
+						await nextjsApi.get<PlaceSearchResult[]>(
+							"/api/internal/places/search",
+							{
+								params: {
+									text,
+									...(near ? { lat: near.lat, lng: near.lng } : {}),
+									...(radiusM ? { radiusM } : {}),
+								},
 							},
-						},
-					)
-				).data;
+						)
+					).data;
+			const near = cityMatch
+				? { lat: cityMatch.latitude, lng: cityMatch.longitude }
+				: undefined;
 
-			let places: PlaceSearchResult[];
-			if (cityMatch) {
-				const near = { lat: cityMatch.latitude, lng: cityMatch.longitude };
-				places = await search(near, CITY_SEARCH_RADIUS_M);
-				if (places.length === 0) {
-					this.ctx.logger.info(
-						{ city: cityMatch.slug },
-						"Geocoding: no results inside city radius, retrying country-wide",
-					);
-					places = await search(near);
-				}
-			} else {
-				places = await search();
-			}
+			const places = await findPlaces({
+				city,
+				spoken: query,
+				lookup: search(near, near ? CITY_SEARCH_RADIUS_M : undefined),
+				widerLookup: near ? search(near) : undefined,
+				apiKey: process.env.OPENROUTER_API_KEY,
+				logger: this.ctx.logger,
+			});
 
 			if (places.length === 0) {
 				return JSON.stringify({

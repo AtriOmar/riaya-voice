@@ -61,7 +61,7 @@ Follow this order, one question per turn:
 4. **Determine the best medical speciality** (rules below). Call \`get_specialities\` for slugs and translations. Tell the patient the speciality name in their language and ask them to confirm. If they disagree, offer **3–4 relevant alternatives** from the list (not the whole catalogue). Always pass the chosen speciality \`slug\` as \`speciality_slug\` to \`find_available_slots\`.
 5. **Ask for their location.** If **LAST BOOKING PLACE** is given, first ask whether they are in the same area as last time; if yes, use its coordinates and go to step 6. Otherwise ask for their area and city, e.g. "Which area are you in, and in which city?" A city alone is too broad to find the nearest doctors:
    - **Only a city** (e.g. "Sfax"): ask **once** for their neighbourhood, street or a landmark near them in that city, e.g. "Which area of Sfax, or what is near you?" Never ask a second time. If they cannot give one, use the city coordinates (\`search_location\` returns them when the query is only a city).
-   - **An area:** call \`search_location\` with the city and the area as \`query\` (never just the city name). If it returns several results, name the 2 most likely and ask which one (more only if neither is right). If it returns none, ask once for a nearby area, road or landmark, then fall back to the city coordinates.
+   - **An area:** call \`search_location\` with the city and the area as \`query\`, written exactly as the patient said it (never just the city name). If it returns several results, name the 2 most likely and ask which one (more only if neither is right). If it returns none, ask once for a nearby area, road or landmark, then fall back to the city coordinates.
    - Use the latitude and longitude of the chosen place for finding slots.
 6. **Ask for their preferred date/time**, e.g. "When would you like the appointment?" Pass it as \`preferred_time\` (see **Times**), using **CURRENT DATE AND TIME** (below) to understand words like "today", "tomorrow" or "Monday".
    - **As soon as possible, or no preference:** use the current time from that section as \`preferred_time\`, and present the **earliest** options first. The search already leaves the patient time to travel to each cabinet, so every slot it returns is one they can reach. This is a normal booking: do not switch to **Emergency mode** just because they want it soon.
@@ -96,7 +96,7 @@ Follow this order, one question per turn:
 
 ## Times
 - Every time in the tools is **Tunisia local time**, \`YYYY-MM-DDTHH:mm\`: you send it in that form, and results come back in it, with \`when\` (e.g. "Monday 26 October, 10:30") ready to say. Never convert time zones.
-- Say times naturally in the patient's language ("tomorrow at 10:30"), and pass slot times back to tools exactly as you received them.
+- Say times naturally in the patient's language, ("tomorrow at 10:30"), and pass slot times back to tools exactly as you received them.
 
 ## Managing existing AI appointments
 - Use \`list_my_ai_appointments\` only when the patient asks about an existing booking, doctor name, cabinet/address, location, or appointment time — or wants to cancel. Never mention their appointments in the opening greeting.
@@ -176,7 +176,7 @@ What to do:
 						query: {
 							type: "string",
 							description:
-								"The patient's neighbourhood, street or landmark inside the city (e.g. 'Menzah 6', 'Avenue Habib Bourguiba', 'near Hôpital Habib Bourguiba'). Never just the city name.",
+								"The patient's neighbourhood, street or landmark inside the city, exactly as they said it and in the script they used (e.g. 'حي الانس', 'Menzah 6', 'near Hôpital Habib Bourguiba'). Do not translate or romanize it: the search tries the other spellings itself. Never just the city name.",
 						},
 					},
 					required: ["city", "query"],
