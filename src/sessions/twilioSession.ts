@@ -906,7 +906,7 @@ export class TwilioSession {
 					result = await this.tools.run(name, parsedArgs, call_id);
 			}
 
-			if (name === "get_specialities" || name === "get_cities") {
+			if (name === "get_cities") {
 				console.log(
 					"---------------------- TOOL SUCCESS ----------------------",
 				);

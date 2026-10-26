@@ -12,7 +12,6 @@ import type { createCallEvent, updateCall } from "../api/callsApi.js";
 import { nextjsApi } from "../api/nextjsApiClient.js";
 import { ensurePersonRow, updatePersonRow } from "../api/personsApi.js";
 import { CITIES } from "../constants/cities.js";
-import { SPECIALITIES } from "../constants/specialities.js";
 import type { CallLanguage } from "../sessions/callInstructions.js";
 import type {
 	BestFitDoctor,
@@ -163,7 +162,7 @@ const TOOL_ERROR_NEXT_STEP: Record<string, string> = {
 	PERSON_NOT_ON_PHONE:
 		"That patient_person_id is not on this phone. Use a patient_person_id from PEOPLE ON THIS LINE, or book them as a new family member (patient_relationship, no patient_person_id).",
 	SPECIALITY_NOT_FOUND:
-		"That speciality_slug does not exist. Call get_specialities and use one of its slugs.",
+		"That speciality_slug does not exist. Use one of the slugs in Specialities.",
 };
 
 /** The tool result for a known API refusal, or null to let the error through. */
@@ -582,9 +581,6 @@ export class CallTools {
 	): Promise<string> {
 		let result: string;
 		switch (name) {
-			case "get_specialities":
-				result = this.getSpecialities();
-				break;
 			case "get_cities":
 				result = this.getCities();
 				break;
@@ -720,17 +716,6 @@ export class CallTools {
 				result = JSON.stringify({ error: `Unknown function: ${name}` });
 		}
 		return result;
-	}
-
-	private getSpecialities(): string {
-		return JSON.stringify(
-			SPECIALITIES.map(({ slug, en_name, fr_name, ar_name }) => ({
-				slug,
-				en_name,
-				fr_name,
-				ar_name,
-			})),
-		);
 	}
 
 	private getCities(): string {
