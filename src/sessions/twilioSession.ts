@@ -63,10 +63,9 @@ export class TwilioSession {
 	private readonly tools: CallTools;
 	/** Ends silent calls and caps call length. */
 	private readonly watchdog: CallWatchdog;
-	private readonly voiceDetector = new CallerVoiceDetector(() => {
-		this.watchdog.callerSpoke();
-		this.tools.callerSpoke();
-	});
+	private readonly voiceDetector = new CallerVoiceDetector(() =>
+		this.watchdog.callerSpoke(),
+	);
 	/** Separate caller transcription; null when CALLER_STT=off (use the realtime model's transcript). */
 	private callerTranscriber: CallerTranscriber | null = null;
 	/** Provider connection is open and can accept `start()`. */
@@ -590,7 +589,6 @@ export class TwilioSession {
 		if (!payload || !this.streamSid) return;
 		if (this.pendingHangup) this.goodbyeAudioStarted = true;
 		this.watchdog.setAssistantSpeaking(true);
-		this.tools.assistantSpoke();
 
 		// Send audio back to Twilio
 		this.twilioWs.send(

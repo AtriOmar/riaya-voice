@@ -252,24 +252,6 @@ function localAppointment(a: CallerAiAppointmentItem) {
 	};
 }
 
-/**
- * An action waiting for the patient's yes. It goes through only once the
- * assistant has spoken since it was asked (the readback) and the caller has
- * spoken after that (the answer).
- */
-type PendingConfirmation = {
-	key: string;
-	readBack: boolean;
-	answered: boolean;
-};
-
-/** What the patient confirms for a booking; the illness wording may change between calls. */
-function bookingKey(a: BookAppointmentToolArgs): string {
-	const p = a.patient;
-	const name = bookingPatientName(p).trim().toLowerCase();
-	return `book:${a.doctorId}:${a.start}:${a.end}:${p.personId ?? ""}:${name}`;
-}
-
 /** Full name for logs and dashboard events. */
 function bookingPatientName(p: BookingPatient): string {
 	return [p.firstName, p.lastName].filter(Boolean).join(" ");
@@ -551,39 +533,8 @@ export class CallTools {
 	private readonly placeLabels = new Map<string, string>();
 	/** The place of the last doctor search, saved on the booking. */
 	private searchPlace: CallerPlace | null = null;
-	/**
-	 * Booking and cancelling wait for the patient's yes. A prompt rule alone is
-	 * not enough: realtime models tend to act on the first "ok". So the first
-	 * call only asks the model to read the details back, and the same call goes
-	 * through after the patient has answered.
-	 */
-	private pendingConfirmation: PendingConfirmation | null = null;
 
 	constructor(private readonly ctx: CallToolsContext) {}
-
-	/** The assistant's reply is playing. Call paths call this as reply audio goes out. */
-	assistantSpoke() {
-		const p = this.pendingConfirmation;
-		if (p) p.readBack = true;
-	}
-
-	/** The caller started talking (live audio, not a transcript, which can arrive late). */
-	callerSpoke() {
-		const p = this.pendingConfirmation;
-		if (p?.readBack) p.answered = true;
-	}
-
-	/** True when the patient has answered the readback of exactly this action; otherwise asks for it. */
-	private confirmed(key: string): boolean {
-		const p = this.pendingConfirmation;
-		if (p?.key === key && p.answered) {
-			this.pendingConfirmation = null;
-			return true;
-		}
-		this.pendingConfirmation = { key, readBack: false, answered: false };
-		this.ctx.logger.info({ key }, "Waiting for the patient's confirmation");
-		return false;
-	}
 
 	/** The place at these coordinates, named when it came from a search, the last booking or the city list. */
 	private placeAt(latitude: number, longitude: number): CallerPlace {
@@ -700,16 +651,6 @@ export class CallTools {
 					});
 					break;
 				}
-				if (!this.confirmed(bookingKey(bookArgs))) {
-					result = JSON.stringify({
-						needs_confirmation: true,
-						patient: bookingPatientName(bookArgs.patient),
-						when: tunisLabel(bookArgs.start),
-						message:
-							"Not sent yet. In one short sentence in the patient's language, read back who it is for, the doctor's name and cabinet area, and this time, then ask whether to send the request, and wait for the answer. If they clearly say yes, call book_appointment again with exactly the same details. If they change anything, use the new details.",
-					});
-					break;
-				}
 				result = await this.bookAppointment(bookArgs);
 				break;
 			}
@@ -759,14 +700,6 @@ export class CallTools {
 						error: true,
 						message:
 							"cancel_appointment: invalid arguments (expected appointment_id)",
-					});
-					break;
-				}
-				if (!this.confirmed(`cancel:${cancelArgs.appointmentId}`)) {
-					result = JSON.stringify({
-						needs_confirmation: true,
-						message:
-							"Not cancelled yet. In one short sentence in the patient's language, read back which appointment (doctor and time) and ask whether to cancel it, and wait for the answer. If they clearly say yes, call cancel_appointment again with the same appointment_id.",
 					});
 					break;
 				}
