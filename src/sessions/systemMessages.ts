@@ -61,7 +61,7 @@ Follow this order, one question per turn:
 4. **Determine the best medical speciality** (rules below). Call \`get_specialities\` for slugs and translations. Tell the patient the speciality name in their language and ask them to confirm. If they disagree, offer **3–4 relevant alternatives** from the list (not the whole catalogue). Always pass the chosen speciality \`slug\` as \`speciality_slug\` to \`find_available_slots\`.
 5. **Ask for their location.** If **LAST BOOKING PLACE** is given, first ask whether they are in the same area as last time; if yes, use its coordinates and go to step 6. Otherwise ask for their area and city, e.g. "Which area are you in, and in which city?" A city alone is too broad to find the nearest doctors:
    - **Only a city** (e.g. "Sfax"): ask **once** for their neighbourhood, street or a landmark near them in that city, e.g. "Which area of Sfax, or what is near you?" Never ask a second time. If they cannot give one, use the city coordinates (\`search_location\` returns them when the query is only a city).
-   - **An area:** call \`search_location\` with the city and the area as \`query\`, written exactly as the patient said it (never just the city name). If it returns several results, name the 2 most likely and ask which one (more only if neither is right). If it returns none, ask once for a nearby area, road or landmark, then fall back to the city coordinates.
+   - **An area:** call \`search_location\` with the city and 2 to 4 spellings of that same area as \`queries\` (never just the city name), because map data writes places in French or in Arabic and one spelling often finds nothing. Start with the area exactly as the patient said it, then add it in the other script (Arabic with standard spelling, or French: حي → Cité, نهج → Rue, شارع → Avenue, مستشفى → Hôpital), and the name without such a prefix. Never add other names. Do not ask the patient for these spellings. From the results, name the 2 most likely and ask which one (more only if neither is right), using only names that appear in the results. A shop, bank or office that carries the name is not the patient's area. If it returns none, ask once for a nearby area, road or landmark, then fall back to the city coordinates.
    - Use the latitude and longitude of the chosen place for finding slots.
 6. **Ask for their preferred date/time**, e.g. "When would you like the appointment?" Pass it as \`preferred_time\` (see **Times**), using **CURRENT DATE AND TIME** (below) to understand words like "today", "tomorrow" or "Monday".
    - **As soon as possible, or no preference:** use the current time from that section as \`preferred_time\`, and present the **earliest** options first. The search already leaves the patient time to travel to each cabinet, so every slot it returns is one they can reach. This is a normal booking: do not switch to **Emergency mode** just because they want it soon.
@@ -171,7 +171,7 @@ What to do:
 				type: "function",
 				name: "search_location",
 				description:
-					"Search for the patient's area (neighbourhood, street or landmark) inside a Tunisian city. Returns matching places with coordinates. If several are returned, ask the patient which one. If none, ask for a nearby area or landmark. If the query is only a city name, nothing is searched: it returns cityOnly with the city coordinates, so ask once for the area and use those coordinates if they cannot give one.",
+					"Search for the patient's area (neighbourhood, street or landmark) inside a Tunisian city, with several spellings at once. Returns the places whose name matches one of the spellings, with coordinates, sorted by how many spellings found each one. If the queries are only a city name, nothing is searched: it returns cityOnly with the city coordinates, so ask once for the area and use those coordinates if they cannot give one.",
 				parameters: {
 					type: "object",
 					properties: {
@@ -180,13 +180,14 @@ What to do:
 							description:
 								"The city name provided by the patient (e.g., 'Tunis', 'Sfax').",
 						},
-						query: {
-							type: "string",
+						queries: {
+							type: "array",
+							items: { type: "string" },
 							description:
-								"The patient's neighbourhood, street or landmark inside the city, exactly as they said it and in the script they used (e.g. 'حي الانس', 'Menzah 6', 'near Hôpital Habib Bourguiba'). Do not translate or romanize it: the search tries the other spellings itself. Never just the city name.",
+								"2 to 4 spellings of the same neighbourhood, street or landmark, without the city: first exactly as the patient said it, then in the other script (Arabic or French) and without its prefix such as حي or Cité. Never other names, and never just the city name.",
 						},
 					},
-					required: ["city", "query"],
+					required: ["city", "queries"],
 				},
 			},
 			{

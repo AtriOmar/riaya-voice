@@ -60,6 +60,7 @@ export interface CallToolsContext {
 }
 
 const CITY_SEARCH_RADIUS_M = 30_000;
+const ARABIC = /[\u0600-\u06FF]/;
 
 /** Coordinates rounded to about 10 m, so the same place matches even if the model rounds them. */
 function placeKey(latitude: number, longitude: number): string {
@@ -638,16 +639,25 @@ export class CallTools {
 				result = this.getCities();
 				break;
 			case "search_location": {
-				const args = parsedArgs as { city?: string; query?: string };
-				if (!args.city || !args.query) {
+				const args = (parsedArgs ?? {}) as {
+					city?: unknown;
+					queries?: unknown;
+				};
+				const queries = Array.isArray(args.queries)
+					? args.queries
+							.filter((q): q is string => typeof q === "string")
+							.map((q) => q.trim())
+							.filter((q) => q !== "")
+					: [];
+				if (typeof args.city !== "string" || queries.length === 0) {
 					result = JSON.stringify({
 						error: true,
 						message:
-							"search_location: invalid arguments (expected city and query)",
+							"search_location: invalid arguments (expected city and queries)",
 					});
 					break;
 				}
-				result = await this.searchLocation(args.city, args.query);
+				result = await this.searchLocation(args.city, queries);
 				break;
 			}
 			case "find_available_slots": {
@@ -815,9 +825,13 @@ export class CallTools {
 		);
 	}
 
-	private async searchLocation(city: string, query: string): Promise<string> {
+	private async searchLocation(
+		city: string,
+		queries: string[],
+	): Promise<string> {
 		// A city alone is too broad to find the nearest doctors: ask for the area first.
-		const queryCity = findCityByName(query);
+		const areas = [...new Set(queries)].filter((q) => !findCityByName(q));
+		const queryCity = areas.length === 0 ? findCityByName(queries[0]) : null;
 		if (queryCity) {
 			return JSON.stringify({
 				found: false,
@@ -855,12 +869,16 @@ export class CallTools {
 				? { lat: cityMatch.latitude, lng: cityMatch.longitude }
 				: undefined;
 
+			// Each spelling goes out with the city in the same script.
+			const texts = areas.map(
+				(q) =>
+					`${q}, ${cityMatch && ARABIC.test(q) ? cityMatch.ar_name : (cityMatch?.fr_name ?? city)}`,
+			);
+
 			const places = await findPlaces({
-				city,
-				spoken: query,
+				texts,
 				lookup: search(near, near ? CITY_SEARCH_RADIUS_M : undefined),
 				widerLookup: near ? search(near) : undefined,
-				apiKey: process.env.OPENROUTER_API_KEY,
 				logger: this.ctx.logger,
 			});
 
@@ -884,15 +902,15 @@ export class CallTools {
 				street: p.street,
 				latitude: p.lat,
 				longitude: p.lng,
+				found_by: p.foundBy,
 			}));
 
 			return JSON.stringify({
 				found: true,
+				searches: texts.length,
 				results,
 				message:
-					results.length > 1
-						? "Multiple results found. Please ask the patient to clarify which one they mean by presenting the options."
-						: "One result found. Proceed with this location.",
+					"Places whose name matches one of your spellings, sorted by found_by (how many spellings found them). If none is the area the patient named, treat it as no result.",
 			});
 		} catch (error) {
 			this.ctx.logger.error({ error }, "Geocoding API error");
