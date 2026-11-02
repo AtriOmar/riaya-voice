@@ -20,6 +20,9 @@ import {
 const TRANSCRIPTION_URL = "https://openrouter.ai/api/v1/audio/transcriptions";
 const CHAT_URL = "https://openrouter.ai/api/v1/chat/completions";
 
+/** Callers say personal and medical things: only providers that neither keep nor train on it. */
+const NO_DATA_RETENTION = { zdr: true, data_collection: "deny" };
+
 const ULAW_TO_LINEAR = (() => {
 	const table = new Int16Array(256);
 	for (let i = 0; i < 256; i++) {
@@ -184,6 +187,7 @@ export class CallerTranscriber {
 							headers,
 							body: JSON.stringify({
 								model: this.opts.model,
+								provider: NO_DATA_RETENTION,
 								temperature: 0,
 								reasoning: { effort: this.opts.reasoningEffort ?? "minimal" },
 								max_tokens: maxTranscriptTokens(seconds),
@@ -207,6 +211,7 @@ export class CallerTranscriber {
 							body: JSON.stringify({
 								model: this.opts.model,
 								input_audio: { data: wavBase64, format: "wav" },
+								provider: NO_DATA_RETENTION,
 							}),
 						});
 			if (!res.ok) {

@@ -1,5 +1,5 @@
 import type { Logger } from "pino";
-import { type RawData, WebSocket } from "ws";
+import type { RawData, WebSocket } from "ws";
 import {
 	type CallerRefusalContext,
 	getCallerRefusalContext,
@@ -19,6 +19,7 @@ import {
 	type RealtimeProvider,
 } from "../realtime/index.js";
 import type { RealtimeHandlers } from "../realtime/types.js";
+import type { DashboardHub } from "../services/dashboardHub.js";
 import {
 	type CallSettings,
 	loadCallSettings,
@@ -143,7 +144,7 @@ export class TwilioSession {
 		private readonly twilioWs: WebSocket,
 		private readonly logger: Logger,
 		private readonly systemMessage: SystemMessage,
-		private readonly dashboardClients: Set<WebSocket>,
+		private readonly dashboard: DashboardHub,
 		/** Test-call page only: call id whose per-call model settings live in Redis. */
 		private readonly settingsSid: string | null = null,
 	) {
@@ -906,7 +907,7 @@ export class TwilioSession {
 					result = await this.tools.run(name, parsedArgs, call_id);
 			}
 
-			if (name === "get_specialities" || name === "get_cities") {
+			if (name === "get_cities") {
 				console.log(
 					"---------------------- TOOL SUCCESS ----------------------",
 				);
@@ -1044,12 +1045,7 @@ export class TwilioSession {
 	// ==================== Dashboard Broadcasting ====================
 
 	private broadcastDashboard(message: DashboardMessage) {
-		const json = JSON.stringify(message);
-		this.dashboardClients.forEach((client) => {
-			if (client.readyState === WebSocket.OPEN) {
-				client.send(json);
-			}
-		});
+		this.dashboard.publish(message);
 	}
 
 	// ==================== Cleanup ====================
