@@ -4,10 +4,12 @@
  * The conversation model passes the place as heard, often Tunisian Arabic in
  * Arabic script, and possibly misheard. One romanization of it ("hay el ons")
  * rarely matches the map data, which names places in French ("Cité El Ons")
- * and sometimes in Arabic. So a small model writes several search texts in both
- * scripts, they are searched in parallel, and the same model keeps only the
- * results that are the place the patient named. Without OPENROUTER_API_KEY, or
- * when the small model fails, the search falls back to the text as heard.
+ * and sometimes in Arabic. So a small model can write several search texts in
+ * both scripts, searched in parallel (`LOCATION_SEARCH_REWRITE=on`). By default
+ * only the text as heard is searched, which keeps a metered geocoder to one
+ * request per search. The same model then keeps only the results that are the
+ * place the patient named. Without OPENROUTER_API_KEY, or when the small model
+ * fails, the results of the text as heard are returned as they are.
  */
 
 import type { Logger } from "pino";
@@ -17,6 +19,9 @@ const MODEL =
 	process.env.LOCATION_SEARCH_MODEL?.trim() || "google/gemini-3.1-flash-lite";
 /** Each model call gives up after this; the search then goes on without it. */
 const MODEL_TIMEOUT_MS = 4000;
+/** Whether the small model writes extra search texts besides the one heard. */
+const REWRITE =
+	process.env.LOCATION_SEARCH_REWRITE?.trim().toLowerCase() === "on";
 const MAX_QUERIES = 5;
 /** Candidates shown to the reviewing model. */
 const MAX_CANDIDATES = 15;
@@ -171,7 +176,7 @@ export async function findPlaces(opts: {
 	heardLookup.catch(() => {});
 
 	let written: string[] = [];
-	if (apiKey) {
+	if (apiKey && REWRITE) {
 		try {
 			written = await writeQueries(apiKey, city, spoken);
 		} catch (error) {
