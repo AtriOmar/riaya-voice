@@ -62,6 +62,11 @@ export function normalizeCallbackReason(raw: unknown): CallbackReason {
 	return raw === "timeout" ? "timeout" : "refused";
 }
 
+/** The request went to exactly one doctor, so the callback speaks of "the doctor". */
+function askedOneDoctor(doctorsAsked: number | null | undefined): boolean {
+	return doctorsAsked === 1;
+}
+
 /**
  * Opening line when Riaya placed the call. Short on purpose: one or two
  * sentences, one question. The detailed options come later in the conversation.
@@ -71,25 +76,34 @@ export function buildCallbackGreetingInstructions(params: {
 	firstName?: string | null;
 	reason: CallbackReason;
 	refusedDoctorName?: string | null;
+	doctorsAsked?: number | null;
 }): string {
 	const name = params.firstName?.trim();
+	const doctor = params.refusedDoctorName
+		? `Dr. ${params.refusedDoctorName}`
+		: "the doctor";
 	const what =
 		params.reason === "refused"
-			? params.refusedDoctorName
-				? `Dr. ${params.refusedDoctorName} could not accept their appointment request`
-				: "the doctor could not accept their appointment request"
-			: "no doctor was able to confirm their appointment request in time";
+			? `${doctor} could not accept their appointment request`
+			: askedOneDoctor(params.doctorsAsked)
+				? `${doctor} did not answer their appointment request in time`
+				: "no doctor was able to confirm their appointment request in time";
 	return `You placed this call. The patient just picked up. Speak in ${LANGUAGE_LABEL[params.lang]}.
 Say at most two short sentences: ${name ? `greet ${name} by first name, ` : "greet them, "}say you are Riaya calling about their appointment request, and tell them ${what}.
 Then ask ONE question: would they like you to find another doctor for them? Stop and wait for the answer.
 Do NOT list doctors or times yet. Do NOT call any functions. Never read out a phone number.`;
 }
 
-function buildCallbackBlock(reason: CallbackReason): string {
+function buildCallbackBlock(
+	reason: CallbackReason,
+	doctorsAsked: number | null | undefined,
+): string {
 	const why =
 		reason === "refused"
 			? "the doctor refused their appointment request"
-			: "no doctor confirmed their appointment request in time, so it was cancelled";
+			: askedOneDoctor(doctorsAsked)
+				? "the doctor did not confirm their appointment request in time, so it was cancelled"
+				: "no doctor confirmed their appointment request in time, so it was cancelled";
 	return `
 
 ## OUTBOUND CALLBACK (YOU CALLED THE PATIENT)
@@ -184,11 +198,14 @@ function buildRefusalBlock(
 		? `Dr. ${context.refusedDoctorName}`
 		: "the doctor";
 	const timedOut = context.reason === "timeout";
+	const single = askedOneDoctor(context.doctorsAsked);
 	const what = timedOut
-		? "no doctor confirmed this caller's recent appointment request in time, so it was cancelled"
+		? `${single ? refused : "no doctor"} did not confirm this caller's recent appointment request in time, so it was cancelled`
 		: `a doctor recently **refused** this caller's appointment request (${refused})`;
 	const sayWhat = timedOut
-		? "no doctor could confirm the request in time"
+		? single
+			? `${refused} did not answer the request in time`
+			: "no doctor could confirm the request in time"
 		: `${refused} could not accept the request`;
 	const sameRequest = buildSameRequestLines(context);
 	return `
@@ -291,7 +308,10 @@ ${profileBlock}
 ${buildLanguageBlock(profile.savedLanguage)}`;
 
 	const callback = profile.callbackReason
-		? buildCallbackBlock(profile.callbackReason)
+		? buildCallbackBlock(
+				profile.callbackReason,
+				profile.refusalContext?.doctorsAsked,
+			)
 		: "";
 	if (!profile.callerPhone) return `${instructions}${callback}`;
 	const withPhone = `${instructions}${callback}${buildPeopleBlock(profile.people ?? [])}${buildLastPlaceBlock(profile.lastPlace)}

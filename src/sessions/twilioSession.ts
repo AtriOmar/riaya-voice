@@ -342,6 +342,7 @@ export class TwilioSession {
 						firstName: this.callerFirstName,
 						reason: this.callbackReason,
 						refusedDoctorName: this.refusalContext?.refusedDoctorName,
+						doctorsAsked: this.refusalContext?.doctorsAsked,
 					})
 				: buildInitialGreetingInstructions(
 						this.callLanguage,

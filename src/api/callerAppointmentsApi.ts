@@ -70,6 +70,8 @@ export type CallerRefusalContext = {
 	/** A doctor refused the request, or nobody accepted it in time. */
 	reason: "refused" | "timeout";
 	refusedDoctorName: string | null;
+	/** How many doctors the request went to; null when unknown. */
+	doctorsAsked: number | null;
 	suggestions: RefusalSuggestion[];
 	patient: RefusedPatient | null;
 	/** The reason for the visit given in the refused request. */
@@ -88,6 +90,7 @@ export async function getCallerRefusalContext(
 			found: boolean;
 			reason?: "refused" | "timeout" | null;
 			refusedDoctorName: string | null;
+			doctorsAsked?: number | null;
 			suggestions: RefusalSuggestion[];
 			patient?: RefusedPatient | null;
 			illness?: string | null;
@@ -100,6 +103,7 @@ export async function getCallerRefusalContext(
 		return {
 			reason: data.reason ?? "refused",
 			refusedDoctorName: data.refusedDoctorName,
+			doctorsAsked: data.doctorsAsked ?? null,
 			suggestions: data.suggestions,
 			patient: data.patient ?? null,
 			illness: data.illness ?? null,
