@@ -1,9 +1,12 @@
 /** Prompt text shared by every call path (Twilio media stream, LiveKit agent). */
 
-import type { CallerRefusalContext } from "../api/callerAppointmentsApi.js";
+import {
+	type CallerRefusalContext,
+	refusalSlotId,
+} from "../api/callerAppointmentsApi.js";
 import type { PersonOnLine } from "../api/callerPeopleApi.js";
 import type { CallerPlace } from "../api/callerPlaceApi.js";
-import { localSlot, toTunisLocal } from "../utils/tunisTime.js";
+import { toTunisLocal, tunisLabel } from "../utils/tunisTime.js";
 
 export type CallLanguage = "en" | "fr" | "ar";
 
@@ -191,7 +194,7 @@ function buildRefusalBlock(
 	const doctors = context.suggestions
 		.map(
 			(s, i) =>
-				`${i + 1}. doctor_id **${s.doctorId}** — ${s.name}${s.cabinetName ? `, ${s.cabinetName}` : ""}${s.address ? `, ${s.address}` : ""} (~${s.distanceKm} km); first slot ${slotLine(s)}`,
+				`${i + 1}. ${s.name} (doctor_id **${s.doctorId}**, for \`find_doctor_slots\`)${s.cabinetName ? `, ${s.cabinetName}` : ""}${s.address ? `, ${s.address}` : ""} (~${s.distanceKm} km); first slot ${slotLine(s, refusalSlotId(i))}`,
 		)
 		.join("\n");
 	const refused = context.refusedDoctorName
@@ -214,15 +217,14 @@ function buildRefusalBlock(
 ${what.charAt(0).toUpperCase()}${what.slice(1)}. ${isCallback ? "You are calling them about it." : "The caller was told to call back and may be calling about it."}
 ${isCallback ? "You already told them in the opening line. When they agree to another doctor, offer these alternatives (same speciality, near the same area), like normal options:" : `Do **not** mention this in the opening greeting. When the patient says they want an appointment, or asks what happened, say briefly that ${sayWhat}, then offer these alternatives (same speciality, near the same area), like normal options:`}
 ${doctors}${sameRequest}
-- If the patient picks one, call \`book_appointment\` with that exact \`doctor_id\` and the listed slot's start and end as \`start\` / \`end\` (you may first call \`find_doctor_slots\` if they want another time).
+- If the patient picks one, call \`book_appointment\` with that doctor's listed slot as \`slot_id\` (you may first call \`find_doctor_slots\` if they want another time).
 - If they want a different speciality, location, or a specific doctor by name, follow the normal flow / \`find_doctor_by_name\`.
 - Never invent doctors or times beyond this list and tool results.`;
 }
 
 /** A suggested slot in Tunisia local time, as the assistant reads it. */
-function slotLine(s: { slotStart: string; slotEnd: string }): string {
-	const slot = localSlot({ start: s.slotStart, end: s.slotEnd });
-	return `${slot.when}: start \`${slot.slotStart}\`, end \`${slot.slotEnd}\``;
+function slotLine(s: { slotStart: string }, slotId: string): string {
+	return `${tunisLabel(s.slotStart)}: slot_id \`${slotId}\``;
 }
 
 function buildCurrentTimeBlock(now: Date = new Date()): string {

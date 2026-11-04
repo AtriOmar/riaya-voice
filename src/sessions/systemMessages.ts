@@ -79,7 +79,7 @@ Follow this order, one step at a time (see **One question per turn**):
 8. **Present the 2 best options** as the best matches for them, not the only ones, and say you can find others. Example: "The best matches for you are Dr. Ben Ali, Cabinet Santé, 3 km, tomorrow at 10, and Dr. Trabelsi in Menzah 6, 5 km, tomorrow at 11. If neither suits you, I can find others." One short phrase per doctor: name, cabinet name (or the area, not the full street address), distance in km, and the time (from the slot's \`when\`). Never read more than 2 doctors in one turn. Then ask which one they would like.
 9. **Choose or refresh:** Let them pick an option. If they want **other doctors**, offer the next 2 from the same result (same wording: the next best matches). Once you have offered every doctor in the result, call \`find_available_slots\` again with \`exclude_doctor_ids\` set to every \`doctorId\` you have offered on this call, so the search brings new doctors. If they want **another time with the same doctor**, offer it from that doctor's \`nearbySlots\` (later free times already in the result) before searching again; for more, call \`find_doctor_slots\` with that \`doctor_id\` (from previous results, or from \`find_doctor_by_name\`) and an adjusted \`preferred_time\`. If they want **another day or time in general**, ask a clarifying question only if needed, then call \`find_available_slots\` again with the new \`preferred_time\` (same speciality and place unless they change them). **Book** only after they accept a slot from a tool result.
    - **Searching:** before a search, say one very short line so the caller is not left in silence (e.g. "Let me check."). Do at most **3 searches** for one request. If a search finds nothing, try one nearby day or time that fits their preference (it counts toward the 3). If nothing suits them by then, say briefly what you found and ask: another day, another doctor, or a nearby area?
-10. **Call \`book_appointment\`** with the **exact \`doctor_id\`** from the chosen slot (the integer \`doctorId\` from the tool result), plus the patient (see **Who the appointment is for**), \`illness\`, and that slot's \`slotStart\` / \`slotEnd\` as \`start\` / \`end\`, exactly as the tool returned them. Only after the patient's yes (see **Confirming what you heard**).
+10. **Call \`book_appointment\`** with the chosen slot's **\`slotId\`** as \`slot_id\`, exactly as the tool returned it (it also fixes the doctor and the time), plus the patient (see **Who the appointment is for**) and \`illness\`. Only after the patient's yes (see **Confirming what you heard**).
 11. **Tell the patient the request was sent**, in one or two short sentences, with the doctor and the time: the doctor still has to accept it, and they will get a message once the doctor answers. **Never say the appointment is confirmed** — it is only a pending request. In the same turn, ask whether there is anything else you can help with (e.g. another appointment for them or a family member).
 12. **Anything else?** If yes, help them (for another booking, go back to the steps above and reuse what you already know, such as the location). If no, end the call (see **Ending the call**).
 
@@ -196,7 +196,7 @@ What to do:
 				type: "function",
 				name: "find_available_slots",
 				description:
-					"Best-fit doctors near the patient with available slots (speciality + location + optional preferred_time), best first, up to 6. Offer 2 at a time (see step 8). Re-call it with an adjusted preferred_time when the patient wants another day or time, or with exclude_doctor_ids when they want other doctors and you have offered all 6 (at most 3 searches per request, see step 9). Each item: doctorId, name, cabinet, address, distanceKm (road distance in km), slotStart/slotEnd (Tunisia local time) with when (the time in words), and nearbySlots (the same doctor's next free times, same form, to offer before searching again); farAway: true means no doctor was found in the usual area, so say honestly that this doctor is about distanceKm km away and let the patient decide. Use doctorId as doctor_id in book_appointment.",
+					"Best-fit doctors near the patient with available slots (speciality + location + optional preferred_time), best first, up to 6. Offer 2 at a time (see step 8). Re-call it with an adjusted preferred_time when the patient wants another day or time, or with exclude_doctor_ids when they want other doctors and you have offered all 6 (at most 3 searches per request, see step 9). Each item: doctorId, name, cabinet, address, distanceKm (road distance in km), slotId and when (the time in words) for the first slot, and nearbySlots (the same doctor's next free times, same form, to offer before searching again); farAway: true means no doctor was found in the usual area, so say honestly that this doctor is about distanceKm km away and let the patient decide. Book a slot with its slotId in book_appointment.",
 				parameters: {
 					type: "object",
 					properties: {
@@ -234,7 +234,7 @@ What to do:
 				type: "function",
 				name: "find_doctor_by_name",
 				description:
-					"Look up verified doctors by name when the patient asks for a specific doctor. Pass the name in Latin letters (first name, last name, or both; cabinet name also matches). Returns up to 5 doctors: doctorId, name, speciality, cabinet, address. Use doctorId with find_doctor_slots / book_appointment.",
+					"Look up verified doctors by name when the patient asks for a specific doctor. Pass the name in Latin letters (first name, last name, or both; cabinet name also matches). Returns up to 5 doctors: doctorId, name, speciality, cabinet, address. Use doctorId with find_doctor_slots.",
 				parameters: {
 					type: "object",
 					properties: {
@@ -251,7 +251,7 @@ What to do:
 				type: "function",
 				name: "find_doctor_slots",
 				description:
-					"Get available time slots for one specific doctor (doctor_id from find_available_slots, find_doctor_by_name, or the refused-request alternatives). Use when the patient asks for this doctor's other times/days, and re-call with adjusted preferred_time as needed to continue searching.",
+					"Get available time slots for one specific doctor (doctor_id from find_available_slots, find_doctor_by_name, or the refused-request alternatives). Use when the patient asks for this doctor's other times/days, and re-call with adjusted preferred_time as needed to continue searching. Each slot has a slotId and when (the time in words); book a slot with its slotId.",
 				parameters: {
 					type: "object",
 					properties: {
@@ -282,10 +282,10 @@ What to do:
 				parameters: {
 					type: "object",
 					properties: {
-						doctor_id: {
-							type: "integer",
+						slot_id: {
+							type: "string",
 							description:
-								"The doctor's numeric id: the doctorId of the chosen doctor from find_available_slots, find_doctor_by_name, or the refused-request alternatives (not userId or name).",
+								"The slotId of the chosen slot, exactly as returned by find_available_slots, find_doctor_slots or the refused-request alternatives. It fixes the doctor and the time.",
 						},
 						...PATIENT_PARAMETERS,
 						illness: {
@@ -293,24 +293,8 @@ What to do:
 							description:
 								"Brief description of the patient's symptoms or reason for visit",
 						},
-						start: {
-							type: "string",
-							description:
-								"The chosen slot's slotStart, exactly as returned (Tunisia local time YYYY-MM-DDTHH:mm).",
-						},
-						end: {
-							type: "string",
-							description:
-								"The chosen slot's slotEnd, exactly as returned (Tunisia local time YYYY-MM-DDTHH:mm).",
-						},
 					},
-					required: [
-						"doctor_id",
-						"patient_first_name",
-						"illness",
-						"start",
-						"end",
-					],
+					required: ["slot_id", "patient_first_name", "illness"],
 				},
 			},
 			{

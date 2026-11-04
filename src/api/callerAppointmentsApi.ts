@@ -59,6 +59,17 @@ export type RefusalSuggestion = {
 	slotEnd: string;
 };
 
+/** The `slot_id` of the nth suggestion's slot (0-based), shown in the prompt and booked like a searched slot. */
+export function refusalSlotId(index: number): string {
+	return `alt${index + 1}`;
+}
+
+/** The suggestion index a `refusalSlotId` stands for; null for any other id. */
+export function refusalSlotIndex(slotId: string): number | null {
+	const m = /^alt(\d+)$/.exec(slotId);
+	return m ? Number(m[1]) - 1 : null;
+}
+
 /** Who the refused request was for: someone on the calling phone. */
 export type RefusedPatient = {
 	personId: number;

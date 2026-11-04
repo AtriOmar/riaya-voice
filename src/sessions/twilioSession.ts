@@ -246,6 +246,9 @@ export class TwilioSession {
 			get lastPlace() {
 				return session.lastPlace;
 			},
+			get refusalContext() {
+				return session.refusalContext;
+			},
 			applyPersonRow: (row) => this.applyPersonRow(row),
 			onProfileChange: ({ firstName, preferredLanguage }) => {
 				if (firstName) this.callerFirstName = firstName;
