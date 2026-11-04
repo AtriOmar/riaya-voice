@@ -809,7 +809,7 @@ export class CallTools {
 				results,
 				message:
 					results.length > 1
-						? "Multiple results found. Please ask the patient to clarify which one they mean by presenting the options."
+						? "Multiple results found. Ask the patient which one they mean, naming each option by what tells it apart (its city, area or street). If you cannot tell the options apart, do not ask: proceed with the first one."
 						: "One result found. Proceed with this location.",
 			});
 		} catch (error) {
