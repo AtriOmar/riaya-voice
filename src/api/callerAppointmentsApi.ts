@@ -59,6 +59,9 @@ export type RefusalSuggestion = {
 	slotEnd: string;
 };
 
+/** Suggestions the assistant reads out at once; the rest stay back until the patient asks for other doctors. */
+export const REFUSAL_OFFER_COUNT = 2;
+
 /** The `slot_id` of the nth suggestion's slot (0-based), shown in the prompt and booked like a searched slot. */
 export function refusalSlotId(index: number): string {
 	return `alt${index + 1}`;
@@ -84,9 +87,15 @@ export type CallerRefusalContext = {
 	/** How many doctors the request went to; null when unknown. */
 	doctorsAsked: number | null;
 	suggestions: RefusalSuggestion[];
+	/** Every doctor already asked for this caller: left out of any new search. */
+	refusedDoctorIds: number[];
+	/** Where a new search starts: the requested time, or now when it has passed. */
+	desiredTime: string | null;
 	patient: RefusedPatient | null;
 	/** The reason for the visit given in the refused request. */
 	illness: string | null;
+	/** The speciality of the refused request; null when unknown. */
+	speciality: { slug: string; name: string } | null;
 };
 
 /**
@@ -103,8 +112,11 @@ export async function getCallerRefusalContext(
 			refusedDoctorName: string | null;
 			doctorsAsked?: number | null;
 			suggestions: RefusalSuggestion[];
+			refusedDoctorIds?: number[];
+			desiredTime?: string | null;
 			patient?: RefusedPatient | null;
 			illness?: string | null;
+			speciality?: { slug: string; name: string } | null;
 		}>(
 			"/api/internal/caller/refusal-context",
 			{ phoneNumber: callerPhone.trim() },
@@ -116,8 +128,11 @@ export async function getCallerRefusalContext(
 			refusedDoctorName: data.refusedDoctorName,
 			doctorsAsked: data.doctorsAsked ?? null,
 			suggestions: data.suggestions,
+			refusedDoctorIds: data.refusedDoctorIds ?? [],
+			desiredTime: data.desiredTime ?? null,
 			patient: data.patient ?? null,
 			illness: data.illness ?? null,
+			speciality: data.speciality ?? null,
 		};
 	} catch (err) {
 		console.error(

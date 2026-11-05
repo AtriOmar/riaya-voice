@@ -2,6 +2,7 @@
 
 import {
 	type CallerRefusalContext,
+	REFUSAL_OFFER_COUNT,
 	refusalSlotId,
 } from "../api/callerAppointmentsApi.js";
 import type { PersonOnLine } from "../api/callerPeopleApi.js";
@@ -184,6 +185,11 @@ function buildSameRequestLines(context: CallerRefusalContext): string {
 			`- The reason given was "${context.illness}". Reuse it as \`illness\` without asking again, unless the caller gives a new one.`,
 		);
 	}
+	if (context.speciality) {
+		lines.push(
+			`- The request was for **${context.speciality.name}** (\`speciality_slug\` **${context.speciality.slug}**). Keep that speciality for any new search and never ask whether to keep it or change it. Only change it if the caller asks for another speciality on their own.`,
+		);
+	}
 	return lines.length > 0 ? `\n${lines.join("\n")}` : "";
 }
 
@@ -192,6 +198,7 @@ function buildRefusalBlock(
 	isCallback: boolean,
 ): string {
 	const doctors = context.suggestions
+		.slice(0, REFUSAL_OFFER_COUNT)
 		.map(
 			(s, i) =>
 				`${i + 1}. ${s.name} (doctor_id **${s.doctorId}**, for \`find_doctor_slots\`)${s.cabinetName ? `, ${s.cabinetName}` : ""}${s.address ? `, ${s.address}` : ""} (~${s.distanceKm} km); first slot ${slotLine(s, refusalSlotId(i))}`,
@@ -218,7 +225,8 @@ ${what.charAt(0).toUpperCase()}${what.slice(1)}. ${isCallback ? "You are calling
 ${isCallback ? "You already told them in the opening line. When they agree to another doctor, offer these alternatives (same speciality, near the same area), like normal options:" : `Do **not** mention this in the opening greeting. When the patient says they want an appointment, or asks what happened, say briefly that ${sayWhat}, then offer these alternatives (same speciality, near the same area), like normal options:`}
 ${doctors}${sameRequest}
 - If the patient picks one, call \`book_appointment\` with that doctor's listed slot as \`slot_id\` (you may first call \`find_doctor_slots\` if they want another time).
-- If they want a different speciality, location, or a specific doctor by name, follow the normal flow / \`find_doctor_by_name\`.
+- If they want other doctors than these, call \`find_available_slots\` with \`other_doctors\` true${context.desiredTime ? ` and \`preferred_time\` \`${toTunisLocal(context.desiredTime)}\`` : ""}: it leaves out the doctors already offered and the one who could not accept.
+- If they ask for a different speciality, location, or a specific doctor by name, follow the normal flow / \`find_doctor_by_name\`.
 - Never invent doctors or times beyond this list and tool results.`;
 }
 
@@ -240,7 +248,9 @@ function buildCurrentTimeBlock(now: Date = new Date()): string {
 
 ## CURRENT DATE AND TIME
 Now in Tunisia: **${local}, ${clock.slice(11)}** (\`${clock}\`).
-Use this for "today", "tomorrow" and weekdays, and as \`preferred_time\` when the patient has no preference.`;
+Use this for "today", "tomorrow" and weekdays, and as \`preferred_time\` when the patient has no preference.
+
+When the patient names a day or a time, pass it as \`preferred_time\` to every slot search. Never tell the patient a doctor has no slot at a time unless a search made with that \`preferred_time\` (check \`searchedFrom\` in the result) came back without it. If the patient asks you to check again, call the tool again before answering.`;
 }
 
 const RELATIONSHIP_LABEL: Record<PersonOnLine["relationship"], string> = {

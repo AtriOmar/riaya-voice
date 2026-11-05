@@ -6,6 +6,7 @@ import {
 	type CallerRefusalContext,
 	cancelCallerAiAppointment,
 	listCallerAiAppointments,
+	REFUSAL_OFFER_COUNT,
 	refusalSlotIndex,
 } from "../api/callerAppointmentsApi.js";
 import type { PersonRelationship } from "../api/callerPeopleApi.js";
@@ -200,12 +201,23 @@ type FindAvailableSlotsArgs = {
 	latitude: number;
 	longitude: number;
 	preferredTime?: string;
-	/** Doctors already offered, left out so a new search brings other doctors. */
-	excludeDoctorIds?: number[];
+	/** The patient wants doctors other than the ones already offered. */
+	otherDoctors?: boolean;
 };
 
-/** Doctors returned per search: three pairs, since the AI offers 2 at a time. */
+/** Doctors a search finds: three pairs, handed to the AI two at a time. */
 const SLOT_SEARCH_RESULTS = 6;
+
+/** Doctors the AI gets per turn, so it never has one to read that it was not meant to offer. */
+const DOCTORS_PER_TURN = 2;
+
+/**
+ * Where a slot search started, in words, so the model can see which days it covered.
+ * A search without a preferred time starts now.
+ */
+function searchedFrom(preferredTime: string | undefined): string {
+	return tunisLabel(preferredTime ?? new Date());
+}
 
 type FindDoctorSlotsArgs = {
 	doctorId: number;
@@ -348,16 +360,13 @@ function normalizeFindAvailableSlotsArgs(
 		preferredLocal !== undefined ? fromTunisLocal(preferredLocal) : undefined;
 	if (latitude === undefined || longitude === undefined) return null;
 	if (preferredTime === null) return null;
-	const excludeRaw = o.exclude_doctor_ids ?? o.excludeDoctorIds;
-	const excludeDoctorIds = Array.isArray(excludeRaw)
-		? excludeRaw.map(Number).filter((id) => Number.isInteger(id) && id > 0)
-		: [];
+	const otherDoctors = o.other_doctors === true || o.otherDoctors === true;
 	return {
 		specialitySlug,
 		latitude,
 		longitude,
 		...(preferredTime !== undefined ? { preferredTime } : {}),
-		...(excludeDoctorIds.length > 0 ? { excludeDoctorIds } : {}),
+		...(otherDoctors ? { otherDoctors } : {}),
 	};
 }
 
@@ -529,6 +538,12 @@ export class CallTools {
 	private searchPlace: CallerPlace | null = null;
 	/** Slots offered on this call, by the id the model books them with. */
 	private readonly slots = new Map<string, OfferedSlot>();
+	/** Doctors the AI was given to offer on this call: left out when the patient wants other doctors. */
+	private readonly offeredDoctorIds = new Set<number>();
+	/** The doctors of the last search not yet given to the AI, best first. */
+	private heldBack: BestFitDoctor[] = [];
+	/** The preferred time of the search `heldBack` came from. */
+	private heldBackFrom: string | undefined;
 
 	constructor(private readonly ctx: CallToolsContext) {}
 
@@ -857,13 +872,27 @@ export class CallTools {
 	): Promise<string> {
 		this.searchPlace = this.placeAt(params.latitude, params.longitude);
 		const path = "/api/doctors/best-fit";
+		const refusal = this.ctx.refusalContext;
+		if (params.otherDoctors && this.heldBack.length > 0) {
+			return this.nextDoctors();
+		}
+
+		// Doctors who could not accept the refused request are never offered again.
+		const excluded = new Set(refusal?.refusedDoctorIds);
+		if (params.otherDoctors) {
+			for (const id of this.offeredDoctorIds) excluded.add(id);
+			for (const s of refusal?.suggestions.slice(0, REFUSAL_OFFER_COUNT) ?? []) {
+				excluded.add(s.doctorId);
+			}
+		}
+
 		// Next route expects query keys: speciality, lat, long, time, exclude
 		const query = {
 			speciality: params.specialitySlug,
 			lat: params.latitude,
 			long: params.longitude,
 			time: params.preferredTime,
-			exclude: params.excludeDoctorIds?.join(","),
+			exclude: excluded.size > 0 ? [...excluded].join(",") : undefined,
 		};
 
 		console.log(
@@ -890,14 +919,28 @@ export class CallTools {
 			);
 			return JSON.stringify({
 				found: false,
-				message: params.excludeDoctorIds
+				searchedFrom: searchedFrom(params.preferredTime),
+				message: params.otherDoctors
 					? "No other doctors with available slots were found for this speciality and location, besides the ones already offered."
 					: "No doctors with available slots were found for this speciality and location.",
 			});
 		}
 
 		// Best first (doctorId = doctorProfile.id for book_appointment)
-		const top = data.slice(0, SLOT_SEARCH_RESULTS).map((doc) => ({
+		this.heldBack = data.slice(0, SLOT_SEARCH_RESULTS);
+		this.heldBackFrom = params.preferredTime;
+		return this.nextDoctors();
+	}
+
+	/**
+	 * The next best doctors of the last search, two per turn. Only these count as offered,
+	 * so the doctors held back stay available when the patient asks for others.
+	 */
+	private nextDoctors(): string {
+		const page = this.heldBack.splice(0, DOCTORS_PER_TURN);
+		for (const doc of page) this.offeredDoctorIds.add(doc.id);
+
+		const top = page.map((doc) => ({
 			doctorId: doc.id,
 			name: `Dr. ${doc.firstName} ${doc.lastName}`,
 			cabinet: doc.cabinetName,
@@ -917,7 +960,7 @@ export class CallTools {
 		console.log(
 			"---------------------- find_available_slots OK ----------------------",
 		);
-		console.log("totalMatches:", data.length, "returned:", top.length);
+		console.log("returned:", top.length, "heldBack:", this.heldBack.length);
 		console.log(
 			"doctorIds:",
 			top.map((d) => d.doctorId),
@@ -927,7 +970,11 @@ export class CallTools {
 			"-------------------------------------------------------------",
 		);
 
-		return JSON.stringify({ found: true, doctors: top });
+		return JSON.stringify({
+			found: true,
+			searchedFrom: searchedFrom(this.heldBackFrom),
+			doctors: top,
+		});
 	}
 
 	private async findDoctorByName(name: string): Promise<string> {
@@ -1005,7 +1052,9 @@ export class CallTools {
 					cabinet: data.doctor.cabinetName,
 					address: data.doctor.address ?? null,
 				},
-				message: "No available slots were found for this doctor.",
+				searchedFrom: searchedFrom(params.preferredTime),
+				message:
+					"No available slots were found for this doctor from the time searched.",
 			});
 		}
 
@@ -1031,6 +1080,7 @@ export class CallTools {
 				cabinet: data.doctor.cabinetName,
 				address: data.doctor.address ?? null,
 			},
+			searchedFrom: searchedFrom(params.preferredTime),
 			slots,
 		});
 	}
