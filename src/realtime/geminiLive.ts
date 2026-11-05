@@ -6,6 +6,7 @@ import type {
 	RealtimeHandlers,
 	RealtimeProvider,
 	RealtimeSessionConfig,
+	RealtimeUsage,
 } from "./types.js";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -20,6 +21,22 @@ const SILENCE_DURATION_MS = parseInt(
 
 const LIVE_URL =
 	"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
+
+type GeminiTokenDetail = { modality?: string; tokenCount?: number };
+
+type GeminiUsage = {
+	promptTokenCount?: number;
+	responseTokenCount?: number;
+	totalTokenCount?: number;
+	promptTokensDetails?: GeminiTokenDetail[];
+	responseTokensDetails?: GeminiTokenDetail[];
+};
+
+function tokensOf(details: GeminiTokenDetail[] | undefined, modality: string) {
+	return (details ?? [])
+		.filter((d) => d.modality === modality)
+		.reduce((sum, d) => sum + (d.tokenCount ?? 0), 0);
+}
 
 type GeminiServerMessage = {
 	setupComplete?: object;
@@ -41,7 +58,7 @@ type GeminiServerMessage = {
 	};
 	toolCallCancellation?: { ids?: string[] };
 	goAway?: { timeLeft?: string };
-	usageMetadata?: unknown;
+	usageMetadata?: GeminiUsage;
 };
 
 /**
@@ -61,6 +78,14 @@ export class GeminiLiveProvider implements RealtimeProvider {
 	/** Gemini streams caller transcription in fragments; flush once the model replies. */
 	private patientTranscript = "";
 	private aiTranscript = "";
+
+	/** Latest token usage Gemini reported; logged once when the session ends. */
+	private lastUsage: GeminiUsage | null = null;
+	private usageLogged = false;
+	/** Every report with its time, and when each turn ended, to learn how Gemini counts. */
+	private readonly usageReports: { atMs: number; usage: GeminiUsage }[] = [];
+	private readonly turnEndsMs: number[] = [];
+	private readonly openedAt = Date.now();
 
 	private readonly model: string;
 	private readonly voice: string;
@@ -97,6 +122,7 @@ export class GeminiLiveProvider implements RealtimeProvider {
 			});
 			ws.on("message", (data: RawData) => this.handleMessage(data));
 			ws.on("close", (code, reason) => {
+				this.logUsage();
 				const why = reason.toString();
 				this.logger.info({ code, reason: why }, "🔴 Gemini WebSocket closed");
 				// Gemini reports fatal errors (bad setup, quota, …) as a close reason.
@@ -144,7 +170,7 @@ export class GeminiLiveProvider implements RealtimeProvider {
 						silenceDurationMs: SILENCE_DURATION_MS,
 					},
 				},
-				inputAudioTranscription: {},
+				...(config.transcribeCaller ? { inputAudioTranscription: {} } : {}),
 				outputAudioTranscription: {},
 				// Audio-only sessions are otherwise capped (~15 min).
 				contextWindowCompression: { slidingWindow: {} },
@@ -210,6 +236,7 @@ export class GeminiLiveProvider implements RealtimeProvider {
 	}
 
 	close() {
+		this.logUsage();
 		if (!this.ws) return;
 		this.ws.removeAllListeners();
 		if (
@@ -218,6 +245,53 @@ export class GeminiLiveProvider implements RealtimeProvider {
 		) {
 			this.ws.close();
 		}
+	}
+
+	/**
+	 * Tokens billed over the call. Gemini sends one report per turn, with the
+	 * tokens of that turn: the whole context again as input (so the prompt is
+	 * billed every turn) and the reply as output. The call total is their sum.
+	 * Input tokens that no modality row accounts for are counted as text.
+	 */
+	getUsage(): RealtimeUsage | null {
+		if (!this.usageReports.length) return null;
+		const total = {
+			textInputTokens: 0,
+			audioInputTokens: 0,
+			textOutputTokens: 0,
+			audioOutputTokens: 0,
+		};
+		for (const { usage } of this.usageReports) {
+			const text = tokensOf(usage.promptTokensDetails, "TEXT");
+			const audio = tokensOf(usage.promptTokensDetails, "AUDIO");
+			const unattributed = Math.max(
+				0,
+				(usage.promptTokenCount ?? 0) - text - audio,
+			);
+			total.textInputTokens += text + unattributed;
+			total.audioInputTokens += audio;
+			total.textOutputTokens += tokensOf(usage.responseTokensDetails, "TEXT");
+			total.audioOutputTokens += tokensOf(usage.responseTokensDetails, "AUDIO");
+		}
+		return {
+			model: this.model,
+			...total,
+			raw: { reports: this.usageReports, turnEndsMs: this.turnEndsMs },
+		};
+	}
+
+	private logUsage() {
+		if (!this.lastUsage || this.usageLogged) return;
+		this.usageLogged = true;
+		this.logger.info(
+			{
+				model: this.model,
+				usage: this.lastUsage,
+				reports: this.usageReports,
+				turnEndsMs: this.turnEndsMs,
+			},
+			"📊 Gemini usage (last report of the session)",
+		);
 	}
 
 	private flushPatientTranscript() {
@@ -242,6 +316,16 @@ export class GeminiLiveProvider implements RealtimeProvider {
 		}
 
 		try {
+			// Usage can ride along with any message, so read it before the branches return.
+			if (msg.usageMetadata) {
+				this.lastUsage = msg.usageMetadata;
+				this.usageReports.push({
+					atMs: Date.now() - this.openedAt,
+					usage: msg.usageMetadata,
+				});
+				this.logger.debug({ usage: msg.usageMetadata }, "📊 Gemini usage");
+			}
+
 			if (msg.setupComplete) {
 				this.logger.info("✅ Gemini setup complete");
 				this.setupComplete = true;
@@ -291,6 +375,7 @@ export class GeminiLiveProvider implements RealtimeProvider {
 				}
 
 				if (sc.turnComplete) {
+					this.turnEndsMs.push(Date.now() - this.openedAt);
 					this.flushPatientTranscript();
 					this.flushAiTranscript();
 					this.handlers.onResponseDone();
@@ -324,10 +409,6 @@ export class GeminiLiveProvider implements RealtimeProvider {
 					"⏳ Gemini session ending soon (goAway)",
 				);
 				return;
-			}
-
-			if (msg.usageMetadata) {
-				this.logger.debug({ usage: msg.usageMetadata }, "📊 Gemini usage");
 			}
 		} catch (error) {
 			this.logger.error({ error }, "🔥 Error processing Gemini message");

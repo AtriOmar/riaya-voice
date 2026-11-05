@@ -3,8 +3,11 @@ import type { Logger } from "pino";
 import { callReportCategories, reportAbusiveCall } from "../api/abuseApi.js";
 import {
 	type CallerAiAppointmentItem,
+	type CallerRefusalContext,
 	cancelCallerAiAppointment,
 	listCallerAiAppointments,
+	REFUSAL_OFFER_COUNT,
+	refusalSlotIndex,
 } from "../api/callerAppointmentsApi.js";
 import type { PersonRelationship } from "../api/callerPeopleApi.js";
 import type { CallerPlace } from "../api/callerPlaceApi.js";
@@ -48,6 +51,8 @@ export interface CallToolsContext {
 	readonly personId: number | null;
 	/** Place of this line's last phone booking, offered again at the location step. */
 	readonly lastPlace: CallerPlace | null;
+	/** The doctors suggested after a refused request; their slots are bookable as `refusalSlotId`. */
+	readonly refusalContext: CallerRefusalContext | null;
 	applyPersonRow(row: PersonRow): void;
 	onProfileChange(change: {
 		firstName?: string;
@@ -150,13 +155,13 @@ const TOOL_ERROR_NEXT_STEP: Record<string, string> = {
 	APPOINTMENT_CONFLICT:
 		"That time was just taken by someone else. Tell the patient in one short sentence, call find_doctor_slots for the same doctor_id with preferred_time set to the time they wanted, and offer the next free time. If that does not suit them, offer the other doctors from the search.",
 	DOCTOR_UNAVAILABLE_DAY:
-		"That day is outside this doctor's opening hours. Book only a slot exactly as returned by find_available_slots or find_doctor_slots: call find_doctor_slots for this doctor_id and offer one of its times.",
+		"That day is outside this doctor's opening hours. Book only a slot returned by find_available_slots or find_doctor_slots: call find_doctor_slots for this doctor_id and offer one of its times.",
 	DOCTOR_UNAVAILABLE_TIME:
-		"That time is outside this doctor's opening hours. Book only a slot exactly as returned by find_available_slots or find_doctor_slots: call find_doctor_slots for this doctor_id and offer one of its times.",
+		"That time is outside this doctor's opening hours. Book only a slot returned by find_available_slots or find_doctor_slots: call find_doctor_slots for this doctor_id and offer one of its times.",
 	INVALID_TIME_RANGE:
-		"start and end are not a valid slot. Use the exact slotStart and slotEnd of the slot the patient chose.",
+		"That slot is not a valid time range. Call find_doctor_slots for the same doctor_id and offer one of its slots.",
 	VALIDATION_ERROR:
-		"Some fields were invalid. Use the exact doctorId, slotStart and slotEnd from the tool result, and the patient's first name.",
+		"Some fields were invalid. Use the exact slotId from the tool result, and the patient's first name.",
 	DOCTOR_NOT_FOUND:
 		"That doctor_id does not exist. Use the doctorId from the search result for the doctor the patient chose.",
 	PERSON_NOT_ON_PHONE:
@@ -196,12 +201,23 @@ type FindAvailableSlotsArgs = {
 	latitude: number;
 	longitude: number;
 	preferredTime?: string;
-	/** Doctors already offered, left out so a new search brings other doctors. */
-	excludeDoctorIds?: number[];
+	/** The patient wants doctors other than the ones already offered. */
+	otherDoctors?: boolean;
 };
 
-/** Doctors returned per search: three pairs, since the AI offers 2 at a time. */
+/** Doctors a search finds: three pairs, handed to the AI two at a time. */
 const SLOT_SEARCH_RESULTS = 6;
+
+/** Doctors the AI gets per turn, so it never has one to read that it was not meant to offer. */
+const DOCTORS_PER_TURN = 2;
+
+/**
+ * Where a slot search started, in words, so the model can see which days it covered.
+ * A search without a preferred time starts now.
+ */
+function searchedFrom(preferredTime: string | undefined): string {
+	return tunisLabel(preferredTime ?? new Date());
+}
 
 type FindDoctorSlotsArgs = {
 	doctorId: number;
@@ -218,12 +234,13 @@ type BookingPatient = {
 };
 
 type BookAppointmentToolArgs = {
-	doctorId: number | string;
+	slotId: string;
 	patient: BookingPatient;
 	illness: string;
-	start: string;
-	end: string;
 };
+
+/** A slot a search offered, as booked through its id. Times are UTC ISO strings. */
+type OfferedSlot = { doctorId: number; start: string; end: string };
 
 type BookEmergencyAppointmentsToolArgs = {
 	specialitySlug: string;
@@ -343,16 +360,13 @@ function normalizeFindAvailableSlotsArgs(
 		preferredLocal !== undefined ? fromTunisLocal(preferredLocal) : undefined;
 	if (latitude === undefined || longitude === undefined) return null;
 	if (preferredTime === null) return null;
-	const excludeRaw = o.exclude_doctor_ids ?? o.excludeDoctorIds;
-	const excludeDoctorIds = Array.isArray(excludeRaw)
-		? excludeRaw.map(Number).filter((id) => Number.isInteger(id) && id > 0)
-		: [];
+	const otherDoctors = o.other_doctors === true || o.otherDoctors === true;
 	return {
 		specialitySlug,
 		latitude,
 		longitude,
 		...(preferredTime !== undefined ? { preferredTime } : {}),
-		...(excludeDoctorIds.length > 0 ? { excludeDoctorIds } : {}),
+		...(otherDoctors ? { otherDoctors } : {}),
 	};
 }
 
@@ -410,23 +424,13 @@ function normalizeBookAppointmentArgs(
 	if (raw === null || typeof raw !== "object" || Array.isArray(raw))
 		return null;
 	const o = raw as Record<string, unknown>;
-	const doctorId = o.doctor_id ?? o.doctorId;
 	const patient = parseBookingPatient(o);
 	const illness = strField(o, "illness", "illness");
-	const startLocal = strField(o, "start", "start");
-	const endLocal = strField(o, "end", "end");
-	const start = startLocal !== undefined ? fromTunisLocal(startLocal) : null;
-	const end = endLocal !== undefined ? fromTunisLocal(endLocal) : null;
-	if (patient === null || illness === undefined || !start || !end) {
+	const slotId = strField(o, "slot_id", "slotId");
+	if (patient === null || illness === undefined || slotId === undefined) {
 		return null;
 	}
-	return {
-		doctorId: doctorId as number | string,
-		patient,
-		illness,
-		start,
-		end,
-	};
+	return { slotId, patient, illness };
 }
 
 function normalizeBookEmergencyAppointmentsArgs(
@@ -532,8 +536,50 @@ export class CallTools {
 	private readonly placeLabels = new Map<string, string>();
 	/** The place of the last doctor search, saved on the booking. */
 	private searchPlace: CallerPlace | null = null;
+	/** Slots offered on this call, by the id the model books them with. */
+	private readonly slots = new Map<string, OfferedSlot>();
+	/** Doctors the AI was given to offer on this call: left out when the patient wants other doctors. */
+	private readonly offeredDoctorIds = new Set<number>();
+	/** The doctors of the last search not yet given to the AI, best first. */
+	private heldBack: BestFitDoctor[] = [];
+	/** The preferred time of the search `heldBack` came from. */
+	private heldBackFrom: string | undefined;
 
 	constructor(private readonly ctx: CallToolsContext) {}
+
+	/**
+	 * Gives a slot the search found an id for the model to book it with, so it never
+	 * has to copy a time. The same slot found again keeps its id.
+	 */
+	private offerSlot(
+		doctorId: number,
+		slot: { start: string; end: string },
+	): { slotId: string; when: string } {
+		for (const [id, offered] of this.slots) {
+			if (offered.doctorId === doctorId && offered.start === slot.start) {
+				return { slotId: id, when: tunisLabel(slot.start) };
+			}
+		}
+		const slotId = `s${this.slots.size + 1}`;
+		this.slots.set(slotId, { doctorId, start: slot.start, end: slot.end });
+		return { slotId, when: tunisLabel(slot.start) };
+	}
+
+	/** A slot offered on this call: by a search, or as an alternative after a refused request. */
+	private findSlot(slotId: string): OfferedSlot | null {
+		const found = this.slots.get(slotId);
+		if (found) return found;
+		const index = refusalSlotIndex(slotId);
+		const suggestion =
+			index === null ? undefined : this.ctx.refusalContext?.suggestions[index];
+		return suggestion
+			? {
+					doctorId: suggestion.doctorId,
+					start: suggestion.slotStart,
+					end: suggestion.slotEnd,
+				}
+			: null;
+	}
 
 	/** The place at these coordinates, named when it came from a search, the last booking or the city list. */
 	private placeAt(latitude: number, longitude: number): CallerPlace {
@@ -643,7 +689,7 @@ export class CallTools {
 					result = JSON.stringify({
 						error: true,
 						message:
-							"book_appointment: invalid arguments (expected doctor_id, patient_first_name, illness, and start / end exactly as slotStart / slotEnd of the chosen slot, Tunisia local time YYYY-MM-DDTHH:mm)",
+							"book_appointment: invalid arguments (expected slot_id (the slotId of the chosen slot, exactly as returned), patient_first_name, illness)",
 					});
 					break;
 				}
@@ -809,7 +855,7 @@ export class CallTools {
 				results,
 				message:
 					results.length > 1
-						? "Multiple results found. Please ask the patient to clarify which one they mean by presenting the options."
+						? "Multiple results found. Ask the patient which one they mean, naming each option by what tells it apart (its city, area or street). If you cannot tell the options apart, do not ask: proceed with the first one."
 						: "One result found. Proceed with this location.",
 			});
 		} catch (error) {
@@ -826,13 +872,27 @@ export class CallTools {
 	): Promise<string> {
 		this.searchPlace = this.placeAt(params.latitude, params.longitude);
 		const path = "/api/doctors/best-fit";
+		const refusal = this.ctx.refusalContext;
+		if (params.otherDoctors && this.heldBack.length > 0) {
+			return this.nextDoctors();
+		}
+
+		// Doctors who could not accept the refused request are never offered again.
+		const excluded = new Set(refusal?.refusedDoctorIds);
+		if (params.otherDoctors) {
+			for (const id of this.offeredDoctorIds) excluded.add(id);
+			for (const s of refusal?.suggestions.slice(0, REFUSAL_OFFER_COUNT) ?? []) {
+				excluded.add(s.doctorId);
+			}
+		}
+
 		// Next route expects query keys: speciality, lat, long, time, exclude
 		const query = {
 			speciality: params.specialitySlug,
 			lat: params.latitude,
 			long: params.longitude,
 			time: params.preferredTime,
-			exclude: params.excludeDoctorIds?.join(","),
+			exclude: excluded.size > 0 ? [...excluded].join(",") : undefined,
 		};
 
 		console.log(
@@ -859,14 +919,28 @@ export class CallTools {
 			);
 			return JSON.stringify({
 				found: false,
-				message: params.excludeDoctorIds
+				searchedFrom: searchedFrom(params.preferredTime),
+				message: params.otherDoctors
 					? "No other doctors with available slots were found for this speciality and location, besides the ones already offered."
 					: "No doctors with available slots were found for this speciality and location.",
 			});
 		}
 
 		// Best first (doctorId = doctorProfile.id for book_appointment)
-		const top = data.slice(0, SLOT_SEARCH_RESULTS).map((doc) => ({
+		this.heldBack = data.slice(0, SLOT_SEARCH_RESULTS);
+		this.heldBackFrom = params.preferredTime;
+		return this.nextDoctors();
+	}
+
+	/**
+	 * The next best doctors of the last search, two per turn. Only these count as offered,
+	 * so the doctors held back stay available when the patient asks for others.
+	 */
+	private nextDoctors(): string {
+		const page = this.heldBack.splice(0, DOCTORS_PER_TURN);
+		for (const doc of page) this.offeredDoctorIds.add(doc.id);
+
+		const top = page.map((doc) => ({
 			doctorId: doc.id,
 			name: `Dr. ${doc.firstName} ${doc.lastName}`,
 			cabinet: doc.cabinetName,
@@ -874,19 +948,19 @@ export class CallTools {
 			distanceKm: Math.round((doc.roadDistanceKm ?? doc.distance) * 10) / 10,
 			// Far fallback: tell the patient the doctor is outside the usual area.
 			...(doc.outsideRadius ? { farAway: true } : {}),
-			...localSlot(doc.nextSlot),
+			...this.offerSlot(doc.id, doc.nextSlot),
 			// Additional nearby slots so the AI can offer alternatives without
 			// a second find_available_slots call.
 			// Other times only: the search lists the main slot among them too.
 			nearbySlots: (doc.nearbySlots ?? [])
 				.filter((slot) => slot.start !== doc.nextSlot.start)
-				.map(localSlot),
+				.map((slot) => this.offerSlot(doc.id, slot)),
 		}));
 
 		console.log(
 			"---------------------- find_available_slots OK ----------------------",
 		);
-		console.log("totalMatches:", data.length, "returned:", top.length);
+		console.log("returned:", top.length, "heldBack:", this.heldBack.length);
 		console.log(
 			"doctorIds:",
 			top.map((d) => d.doctorId),
@@ -896,7 +970,11 @@ export class CallTools {
 			"-------------------------------------------------------------",
 		);
 
-		return JSON.stringify({ found: true, doctors: top });
+		return JSON.stringify({
+			found: true,
+			searchedFrom: searchedFrom(this.heldBackFrom),
+			doctors: top,
+		});
 	}
 
 	private async findDoctorByName(name: string): Promise<string> {
@@ -974,11 +1052,15 @@ export class CallTools {
 					cabinet: data.doctor.cabinetName,
 					address: data.doctor.address ?? null,
 				},
-				message: "No available slots were found for this doctor.",
+				searchedFrom: searchedFrom(params.preferredTime),
+				message:
+					"No available slots were found for this doctor from the time searched.",
 			});
 		}
 
-		const slots = data.slots.map(localSlot);
+		const slots = data.slots.map((slot) =>
+			this.offerSlot(data.doctor.id, slot),
+		);
 
 		console.log(
 			"---------------------- find_doctor_slots OK ----------------------",
@@ -998,6 +1080,7 @@ export class CallTools {
 				cabinet: data.doctor.cabinetName,
 				address: data.doctor.address ?? null,
 			},
+			searchedFrom: searchedFrom(params.preferredTime),
 			slots,
 		});
 	}
@@ -1149,31 +1232,28 @@ export class CallTools {
 			throw new Error(msg);
 		}
 
-		const doctorId = Number(params.doctorId);
-		if (
-			!Number.isFinite(doctorId) ||
-			doctorId <= 0 ||
-			!Number.isInteger(doctorId)
-		) {
-			const msg = `Invalid doctorId: expected a positive integer (from find_available_slots doctorId), got ${JSON.stringify(params.doctorId)}`;
+		const slot = this.findSlot(params.slotId);
+		if (!slot) {
 			console.log(
-				"---------------------- book_appointment VALIDATION ERROR ----------------------",
+				"---------------------- book_appointment UNKNOWN SLOT ----------------------",
 			);
-			console.log("params:", JSON.stringify(params, null, 2));
-			console.log("doctorIdParsed:", doctorId);
+			console.log("slotId:", params.slotId);
 			console.log(
 				"-------------------------------------------------------------",
 			);
-			throw new Error(msg);
+			return JSON.stringify({
+				error: true,
+				message: `Unknown slot_id ${JSON.stringify(params.slotId)}. Use the slotId of a slot a search returned on this call, exactly as given.`,
+			});
 		}
 
 		const body: BookAppointmentParams = {
-			doctorId,
+			doctorId: slot.doctorId,
 			phoneNumber: callerRaw,
 			patient: params.patient,
 			illness: params.illness,
-			start: params.start,
-			end: params.end,
+			start: slot.start,
+			end: slot.end,
 			...(this.searchPlace
 				? {
 						patientPlace: {

@@ -617,6 +617,9 @@ export default defineAgent({
 				return personId;
 			},
 			lastPlace,
+			get refusalContext() {
+				return refusalContext;
+			},
 			applyPersonRow,
 			onProfileChange: (change) => {
 				if (change.firstName) firstName = change.firstName;

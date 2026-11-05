@@ -4,10 +4,12 @@
  * The conversation model passes the place as heard, often Tunisian Arabic in
  * Arabic script, and possibly misheard. One romanization of it ("hay el ons")
  * rarely matches the map data, which names places in French ("Cité El Ons")
- * and sometimes in Arabic. So a small model writes several search texts in both
- * scripts, they are searched in parallel, and the same model keeps only the
- * results that are the place the patient named. Without OPENROUTER_API_KEY, or
- * when the small model fails, the search falls back to the text as heard.
+ * and sometimes in Arabic. So a small model can write several search texts in
+ * both scripts, searched in parallel (`LOCATION_SEARCH_REWRITE=on`). By default
+ * only the text as heard is searched, which keeps a metered geocoder to one
+ * request per search. The same model then keeps only the results that are the
+ * place the patient named. Without OPENROUTER_API_KEY, or when the small model
+ * fails, the results of the text as heard are returned as they are.
  */
 
 import type { Logger } from "pino";
@@ -17,6 +19,9 @@ const MODEL =
 	process.env.LOCATION_SEARCH_MODEL?.trim() || "google/gemini-3.1-flash-lite";
 /** Each model call gives up after this; the search then goes on without it. */
 const MODEL_TIMEOUT_MS = 4000;
+/** Whether the small model writes extra search texts besides the one heard. */
+const REWRITE =
+	process.env.LOCATION_SEARCH_REWRITE?.trim().toLowerCase() === "on";
 const MAX_QUERIES = 5;
 /** Candidates shown to the reviewing model. */
 const MAX_CANDIDATES = 15;
@@ -53,6 +58,7 @@ function reviewPrompt(city: string, spoken: string): string {
 		"Keep only results that are the place they named: the same name in any script or spelling (الأنس = El Ons = Elons), allowing for a word misheard by speech recognition.",
 		"Drop results that only share a common word (Cité, Rue, Hay, El, حي) or are a different place.",
 		`Order the kept results best first: a neighbourhood or landmark with that name before a street or building that only carries the name, and places in or near ${city} before others.`,
+		"When several results are the same place (same name, same area, e.g. a municipality listed twice), keep only the best one of them: the patient cannot tell them apart, so asking would only confuse them. Keep several only when they are different places the patient could mean (Cité El Ons vs Rue El Ons, or the same name in two different cities).",
 		'Reply with JSON only: {"matches": number[]} with the result numbers, or {"matches": []} if none is that place.',
 	].join(" ");
 }
@@ -153,6 +159,39 @@ async function lookUpAll(
 		.map((h) => h.place);
 }
 
+/** Same name in the same state this close is one place to a patient. */
+const SAME_PLACE_KM = 15;
+
+function distanceKm(a: PlaceSearchResult, b: PlaceSearchResult): number {
+	const rad = Math.PI / 180;
+	const dLat = ((b.lat ?? 0) - (a.lat ?? 0)) * rad;
+	const dLng = ((b.lng ?? 0) - (a.lng ?? 0)) * rad;
+	const h =
+		Math.sin(dLat / 2) ** 2 +
+		Math.cos((a.lat ?? 0) * rad) *
+			Math.cos((b.lat ?? 0) * rad) *
+			Math.sin(dLng / 2) ** 2;
+	return 12742 * Math.asin(Math.sqrt(h));
+}
+
+/**
+ * Drops results the patient could not tell apart from a better ranked one:
+ * same label and state, a few kilometres apart. Does not depend on the model.
+ */
+function mergeSamePlaces(places: PlaceSearchResult[]): PlaceSearchResult[] {
+	const kept: PlaceSearchResult[] = [];
+	for (const p of places) {
+		const twin = kept.some(
+			(k) =>
+				k.label.trim().toLowerCase() === p.label.trim().toLowerCase() &&
+				k.state === p.state &&
+				distanceKm(k, p) <= SAME_PLACE_KM,
+		);
+		if (!twin) kept.push(p);
+	}
+	return kept;
+}
+
 export async function findPlaces(opts: {
 	city: string;
 	/** The place as the patient said it, in whatever script. */
@@ -171,7 +210,7 @@ export async function findPlaces(opts: {
 	heardLookup.catch(() => {});
 
 	let written: string[] = [];
-	if (apiKey) {
+	if (apiKey && REWRITE) {
 		try {
 			written = await writeQueries(apiKey, city, spoken);
 		} catch (error) {
@@ -189,7 +228,7 @@ export async function findPlaces(opts: {
 		);
 		candidates = await lookUpAll(texts, widerLookup);
 	}
-	candidates = candidates.slice(0, MAX_CANDIDATES);
+	candidates = mergeSamePlaces(candidates).slice(0, MAX_CANDIDATES);
 	logger.info(
 		{
 			spoken,
@@ -211,7 +250,7 @@ export async function findPlaces(opts: {
 			{ picked: picked.map((p) => p.label), totalMs: Date.now() - startedAt },
 			"Location search: reviewed",
 		);
-		return picked.slice(0, MAX_RESULTS);
+		return mergeSamePlaces(picked).slice(0, MAX_RESULTS);
 	} catch (error) {
 		logger.warn({ error }, "Location search: review failed, keeping all");
 		return candidates.slice(0, MAX_RESULTS);

@@ -1,9 +1,13 @@
 /** Prompt text shared by every call path (Twilio media stream, LiveKit agent). */
 
-import type { CallerRefusalContext } from "../api/callerAppointmentsApi.js";
+import {
+	type CallerRefusalContext,
+	REFUSAL_OFFER_COUNT,
+	refusalSlotId,
+} from "../api/callerAppointmentsApi.js";
 import type { PersonOnLine } from "../api/callerPeopleApi.js";
 import type { CallerPlace } from "../api/callerPlaceApi.js";
-import { localSlot, toTunisLocal } from "../utils/tunisTime.js";
+import { toTunisLocal, tunisLabel } from "../utils/tunisTime.js";
 
 export type CallLanguage = "en" | "fr" | "ar";
 
@@ -62,6 +66,11 @@ export function normalizeCallbackReason(raw: unknown): CallbackReason {
 	return raw === "timeout" ? "timeout" : "refused";
 }
 
+/** The request went to exactly one doctor, so the callback speaks of "the doctor". */
+function askedOneDoctor(doctorsAsked: number | null | undefined): boolean {
+	return doctorsAsked === 1;
+}
+
 /**
  * Opening line when Riaya placed the call. Short on purpose: one or two
  * sentences, one question. The detailed options come later in the conversation.
@@ -71,25 +80,34 @@ export function buildCallbackGreetingInstructions(params: {
 	firstName?: string | null;
 	reason: CallbackReason;
 	refusedDoctorName?: string | null;
+	doctorsAsked?: number | null;
 }): string {
 	const name = params.firstName?.trim();
+	const doctor = params.refusedDoctorName
+		? `Dr. ${params.refusedDoctorName}`
+		: "the doctor";
 	const what =
 		params.reason === "refused"
-			? params.refusedDoctorName
-				? `Dr. ${params.refusedDoctorName} could not accept their appointment request`
-				: "the doctor could not accept their appointment request"
-			: "no doctor was able to confirm their appointment request in time";
+			? `${doctor} could not accept their appointment request`
+			: askedOneDoctor(params.doctorsAsked)
+				? `${doctor} did not answer their appointment request in time`
+				: "no doctor was able to confirm their appointment request in time";
 	return `You placed this call. The patient just picked up. Speak in ${LANGUAGE_LABEL[params.lang]}.
 Say at most two short sentences: ${name ? `greet ${name} by first name, ` : "greet them, "}say you are Riaya calling about their appointment request, and tell them ${what}.
 Then ask ONE question: would they like you to find another doctor for them? Stop and wait for the answer.
 Do NOT list doctors or times yet. Do NOT call any functions. Never read out a phone number.`;
 }
 
-function buildCallbackBlock(reason: CallbackReason): string {
+function buildCallbackBlock(
+	reason: CallbackReason,
+	doctorsAsked: number | null | undefined,
+): string {
 	const why =
 		reason === "refused"
 			? "the doctor refused their appointment request"
-			: "no doctor confirmed their appointment request in time, so it was cancelled";
+			: askedOneDoctor(doctorsAsked)
+				? "the doctor did not confirm their appointment request in time, so it was cancelled"
+				: "no doctor confirmed their appointment request in time, so it was cancelled";
 	return `
 
 ## OUTBOUND CALLBACK (YOU CALLED THE PATIENT)
@@ -167,6 +185,11 @@ function buildSameRequestLines(context: CallerRefusalContext): string {
 			`- The reason given was "${context.illness}". Reuse it as \`illness\` without asking again, unless the caller gives a new one.`,
 		);
 	}
+	if (context.speciality) {
+		lines.push(
+			`- The request was for **${context.speciality.name}** (\`speciality_slug\` **${context.speciality.slug}**). Keep that speciality for any new search and never ask whether to keep it or change it. Only change it if the caller asks for another speciality on their own.`,
+		);
+	}
 	return lines.length > 0 ? `\n${lines.join("\n")}` : "";
 }
 
@@ -175,20 +198,24 @@ function buildRefusalBlock(
 	isCallback: boolean,
 ): string {
 	const doctors = context.suggestions
+		.slice(0, REFUSAL_OFFER_COUNT)
 		.map(
 			(s, i) =>
-				`${i + 1}. doctor_id **${s.doctorId}** — ${s.name}${s.cabinetName ? `, ${s.cabinetName}` : ""}${s.address ? `, ${s.address}` : ""} (~${s.distanceKm} km); first slot ${slotLine(s)}`,
+				`${i + 1}. ${s.name} (doctor_id **${s.doctorId}**, for \`find_doctor_slots\`)${s.cabinetName ? `, ${s.cabinetName}` : ""}${s.address ? `, ${s.address}` : ""} (~${s.distanceKm} km); first slot ${slotLine(s, refusalSlotId(i))}`,
 		)
 		.join("\n");
 	const refused = context.refusedDoctorName
 		? `Dr. ${context.refusedDoctorName}`
 		: "the doctor";
 	const timedOut = context.reason === "timeout";
+	const single = askedOneDoctor(context.doctorsAsked);
 	const what = timedOut
-		? "no doctor confirmed this caller's recent appointment request in time, so it was cancelled"
+		? `${single ? refused : "no doctor"} did not confirm this caller's recent appointment request in time, so it was cancelled`
 		: `a doctor recently **refused** this caller's appointment request (${refused})`;
 	const sayWhat = timedOut
-		? "no doctor could confirm the request in time"
+		? single
+			? `${refused} did not answer the request in time`
+			: "no doctor could confirm the request in time"
 		: `${refused} could not accept the request`;
 	const sameRequest = buildSameRequestLines(context);
 	return `
@@ -197,15 +224,15 @@ function buildRefusalBlock(
 ${what.charAt(0).toUpperCase()}${what.slice(1)}. ${isCallback ? "You are calling them about it." : "The caller was told to call back and may be calling about it."}
 ${isCallback ? "You already told them in the opening line. When they agree to another doctor, offer these alternatives (same speciality, near the same area), like normal options:" : `Do **not** mention this in the opening greeting. When the patient says they want an appointment, or asks what happened, say briefly that ${sayWhat}, then offer these alternatives (same speciality, near the same area), like normal options:`}
 ${doctors}${sameRequest}
-- If the patient picks one, call \`book_appointment\` with that exact \`doctor_id\` and the listed slot's start and end as \`start\` / \`end\` (you may first call \`find_doctor_slots\` if they want another time).
-- If they want a different speciality, location, or a specific doctor by name, follow the normal flow / \`find_doctor_by_name\`.
+- If the patient picks one, call \`book_appointment\` with that doctor's listed slot as \`slot_id\` (you may first call \`find_doctor_slots\` if they want another time).
+- If they want other doctors than these, call \`find_available_slots\` with \`other_doctors\` true${context.desiredTime ? ` and \`preferred_time\` \`${toTunisLocal(context.desiredTime)}\`` : ""}: it leaves out the doctors already offered and the one who could not accept.
+- If they ask for a different speciality, location, or a specific doctor by name, follow the normal flow / \`find_doctor_by_name\`.
 - Never invent doctors or times beyond this list and tool results.`;
 }
 
 /** A suggested slot in Tunisia local time, as the assistant reads it. */
-function slotLine(s: { slotStart: string; slotEnd: string }): string {
-	const slot = localSlot({ start: s.slotStart, end: s.slotEnd });
-	return `${slot.when}: start \`${slot.slotStart}\`, end \`${slot.slotEnd}\``;
+function slotLine(s: { slotStart: string }, slotId: string): string {
+	return `${tunisLabel(s.slotStart)}: slot_id \`${slotId}\``;
 }
 
 function buildCurrentTimeBlock(now: Date = new Date()): string {
@@ -221,7 +248,9 @@ function buildCurrentTimeBlock(now: Date = new Date()): string {
 
 ## CURRENT DATE AND TIME
 Now in Tunisia: **${local}, ${clock.slice(11)}** (\`${clock}\`).
-Use this for "today", "tomorrow" and weekdays, and as \`preferred_time\` when the patient has no preference.`;
+Use this for "today", "tomorrow" and weekdays, and as \`preferred_time\` when the patient has no preference.
+
+When the patient names a day or a time, pass it as \`preferred_time\` to every slot search. Never tell the patient a doctor has no slot at a time unless a search made with that \`preferred_time\` (check \`searchedFrom\` in the result) came back without it. If the patient asks you to check again, call the tool again before answering.`;
 }
 
 const RELATIONSHIP_LABEL: Record<PersonOnLine["relationship"], string> = {
@@ -282,7 +311,7 @@ export function buildCallInstructions(
 	const knownName = profile.firstName?.trim();
 	const profileBlock = knownName
 		? `Known first name of the phone owner: **${knownName}** (used in the greeting). Do not ask for it again unless the caller says they are someone else.`
-		: "No name on file for the phone owner. Ask for the patient's name at step 2, once you know who the appointment is for.";
+		: "No name on file for the phone owner. Ask for the patient's name at step 2 (the caller, unless they said the appointment is for someone else).";
 	const instructions = `${systemPrompt}${buildCurrentTimeBlock()}
 
 ## CALLER PROFILE
@@ -291,7 +320,10 @@ ${profileBlock}
 ${buildLanguageBlock(profile.savedLanguage)}`;
 
 	const callback = profile.callbackReason
-		? buildCallbackBlock(profile.callbackReason)
+		? buildCallbackBlock(
+				profile.callbackReason,
+				profile.refusalContext?.doctorsAsked,
+			)
 		: "";
 	if (!profile.callerPhone) return `${instructions}${callback}`;
 	const withPhone = `${instructions}${callback}${buildPeopleBlock(profile.people ?? [])}${buildLastPlaceBlock(profile.lastPlace)}

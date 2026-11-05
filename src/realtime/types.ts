@@ -30,6 +30,17 @@ export type RealtimeHandlers = {
 	onClose(): void;
 };
 
+/** Billed tokens of one model over a whole call, as saved on the call. */
+export type RealtimeUsage = {
+	model: string;
+	textInputTokens: number;
+	audioInputTokens: number;
+	textOutputTokens: number;
+	audioOutputTokens: number;
+	/** The provider's own usage object, kept so the counts can be recomputed. */
+	raw: unknown;
+};
+
 export type RealtimeSessionConfig = {
 	instructions: string;
 	tools: SystemMessageTool[];
@@ -37,6 +48,11 @@ export type RealtimeSessionConfig = {
 	language?: "en" | "fr" | "ar";
 	/** Caller's known first name — for providers that can't rewrite instructions mid-call. */
 	firstName?: string | null;
+	/**
+	 * Whether the model should transcribe the caller itself. False when a
+	 * separate transcriber does it, so providers that bill for it can skip it.
+	 */
+	transcribeCaller: boolean;
 };
 
 export interface RealtimeProvider {
@@ -55,5 +71,7 @@ export interface RealtimeProvider {
 	prompt(instructions: string): void;
 	/** Stop reacting to caller speech (goodbye is playing, hangup pending). */
 	enterClosingMode(): void;
+	/** Tokens billed so far in this call. Only providers that report usage implement it. */
+	getUsage?(): RealtimeUsage | null;
 	close(): void;
 }
