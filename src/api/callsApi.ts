@@ -84,3 +84,23 @@ export async function updateCall(
 		console.error("[callsApi] updateCall failed", err);
 	}
 }
+
+export type SaveCallUsageInput = {
+	model: string;
+	textInputTokens: number;
+	audioInputTokens: number;
+	textOutputTokens: number;
+	audioOutputTokens: number;
+	raw?: unknown;
+};
+
+export async function saveCallUsage(
+	callId: number,
+	input: SaveCallUsageInput,
+): Promise<void> {
+	try {
+		await nextjsApi.put(`/api/calls/${callId}/usage`, input);
+	} catch (err) {
+		console.error("[callsApi] saveCallUsage failed", err);
+	}
+}

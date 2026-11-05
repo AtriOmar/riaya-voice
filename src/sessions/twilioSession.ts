@@ -10,7 +10,12 @@ import {
 	type PersonOnLine,
 } from "../api/callerPeopleApi.js";
 import { type CallerPlace, getCallerLastPlace } from "../api/callerPlaceApi.js";
-import { createCallEvent, ensureCallRow, updateCall } from "../api/callsApi.js";
+import {
+	createCallEvent,
+	ensureCallRow,
+	saveCallUsage,
+	updateCall,
+} from "../api/callsApi.js";
 import { ensurePersonRow } from "../api/personsApi.js";
 import { getTwilioClient } from "../api/twilioClient.js";
 import {
@@ -338,6 +343,7 @@ export class TwilioSession {
 				tools: this.systemMessage.tools,
 				language: this.callLanguage,
 				firstName: this.callerFirstName,
+				transcribeCaller: !this.callerTranscriber,
 			},
 			this.callbackReason
 				? buildCallbackGreetingInstructions({
@@ -370,6 +376,7 @@ export class TwilioSession {
 			tools: this.systemMessage.tools,
 			language: this.callLanguage,
 			firstName: this.callerFirstName,
+			transcribeCaller: !this.callerTranscriber,
 		});
 	}
 
@@ -1060,6 +1067,8 @@ export class TwilioSession {
 		this.clearHangupTimers();
 		this.callerTranscriber?.close();
 
+		const usage = this.provider?.getUsage?.();
+		if (usage) void this.withCallId((id) => saveCallUsage(id, usage));
 		this.provider?.close();
 
 		if (this.twilioWs) {
