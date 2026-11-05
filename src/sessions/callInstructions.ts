@@ -301,7 +301,7 @@ export function buildCallInstructions(
 	const knownName = profile.firstName?.trim();
 	const profileBlock = knownName
 		? `Known first name of the phone owner: **${knownName}** (used in the greeting). Do not ask for it again unless the caller says they are someone else.`
-		: "No name on file for the phone owner. Ask for the patient's name at step 2, once you know who the appointment is for.";
+		: "No name on file for the phone owner. Ask for the patient's name at step 2 (the caller, unless they said the appointment is for someone else).";
 	const instructions = `${systemPrompt}${buildCurrentTimeBlock()}
 
 ## CALLER PROFILE
